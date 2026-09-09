@@ -1,0 +1,44 @@
+name: lint
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # Both steps below fail if they find nothing to check.
+      #
+      # A lint whose glob matches no files exits 0 and reports green forever,
+      # including after somebody renames the directory it was pointed at. That
+      # is worse than having no lint, because it looks like coverage. PHP is
+      # preinstalled on the runner image, so there is no toolchain step here.
+      - name: Lint PHP
+        run: |
+          mapfile -t files < <(find . -type f -name '*.php' -not -path './.git/*' | sort)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No PHP found. This check would otherwise pass by checking nothing."
+            exit 1
+          fi
+          echo "Linting ${#files[@]} file(s) with $(php -v | head -1)"
+          for f in "${files[@]}"; do
+            php -l "$f"
+          done
+
+      - name: Check shell scripts
+        run: |
+          mapfile -t files < <(find . -type f -name '*.sh' -not -path './.git/*' | sort)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No shell scripts found. This check would otherwise pass by checking nothing."
+            exit 1
+          fi
+          echo "Checking ${#files[@]} script(s)"
+          for f in "${files[@]}"; do
+            echo "  $f"
+            bash -n "$f"
+          done
