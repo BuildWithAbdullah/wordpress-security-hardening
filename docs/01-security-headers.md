@@ -37,14 +37,37 @@ effect.
 ## Verify, always
 
 ```bash
-./scripts/check-headers.sh https://example.com
+bash scripts/check-headers.sh https://example.com
 ```
 
 Deploying a header and never checking the live response is a routine gap. The
-script follows redirects, checks the five, notes whether a CSP is present, and
-flags `X-Powered-By` and `Server` values that leak version information. It
-exits non-zero when a required header is missing, so it works as a post-deploy
-check.
+script makes one GET request, follows redirects, and hands the saved headers to
+`scripts/judge-headers.sh`, which decides. It exits non-zero when a required
+header is missing or carries a value that does nothing, so it works as a
+post-deploy check.
+
+Two things about it are worth knowing, because both were wrong in the first
+version of this repository and both produced a confident pass rather than an
+error.
+
+It judges the **final** response only. A header sent on the redirect from
+`http://` to `https://` and not on the page is reported as
+`redirect-only`, not as present. Any checker that searches a whole redirect
+chain for a header name will tell you that site is covered.
+
+It checks **values**, not just presence. `X-Frame-Options: ALLOWALL` is a
+finding, because a permissive value that passes a check is worse than a missing
+header: the check is what stops anyone looking again.
+
+To judge a response you already have, with no request made at all:
+
+```bash
+bash scripts/judge-headers.sh saved.headers --url https://example.com/
+bash scripts/judge-headers.sh saved.headers --url https://example.com/ --json
+```
+
+Every finding either script can emit is listed in
+[07 Every finding](07-every-finding.md).
 
 ## HSTS deserves its own paragraph
 
