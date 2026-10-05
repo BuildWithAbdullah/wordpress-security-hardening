@@ -368,14 +368,32 @@ assert(
   'the dead interest-cohort directive is back in the header set',
 );
 
-/** Counts in the README are the first thing a reader checks, so they have to hold. */
-const testOutput = execFileSync('node', ['--test', ...readdirSync(join(ROOT, 'test')).map((f) => `test/${f}`)], {
-  cwd: ROOT,
-  encoding: 'utf8',
-  stdio: ['ignore', 'pipe', 'ignore'],
-});
-const passCount = Number(testOutput.match(/^# pass (\d+)$/m)?.[1] ?? -1);
+/**
+ * Counts in the README are the first thing a reader checks, so they have to
+ * hold.
+ *
+ * The reporter is named rather than left to the default, and that is not
+ * decoration. Node 20 and 22 print TAP when output is piped; Node 24 prints the
+ * spec reporter regardless, so the summary line changes from "# pass 82" to one
+ * with a leading information glyph. Parsing whatever the runner happened to
+ * print meant this check passed on two Node versions and failed on the third,
+ * for no reason connected to the repository. Asking for TAP pins the format,
+ * and the fallback below reads the other shape anyway.
+ */
+const testOutput = execFileSync(
+  'node',
+  ['--test', '--test-reporter=tap', ...readdirSync(join(ROOT, 'test')).map((f) => `test/${f}`)],
+  {
+    cwd: ROOT,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'ignore'],
+  },
+);
+const passCount = Number(testOutput.match(/^[^\d\n]*pass (\d+)$/m)?.[1] ?? -1);
 assert(passCount > 0, 'could not read the test count from the runner');
+
+const failCount = Number(testOutput.match(/^[^\d\n]*fail (\d+)$/m)?.[1] ?? -1);
+assert(failCount === 0, `the suite reports ${failCount} failing tests`);
 assert(
   readme.includes(`${passCount} tests`),
   `the README does not say ${passCount} tests, which is what the suite runs`,
