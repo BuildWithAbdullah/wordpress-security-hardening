@@ -129,10 +129,16 @@ an example cannot drift from the thing it documents.
 ## Verify against a live site
 
 ```bash
-./scripts/check-headers.sh https://example.com
-./scripts/check-headers.sh https://example.com --json
-./scripts/check-headers.sh https://example.com --save response.headers
+bash scripts/check-headers.sh https://example.com
+bash scripts/check-headers.sh https://example.com --json
+bash scripts/check-headers.sh https://example.com --save response.headers
 ```
+
+Run through `bash` rather than directly, or `chmod +x scripts/*.sh` once. Not
+every way of obtaining a repository carries file modes: a source zip and
+GitHub's own web upload both produce mode 644, so a script that depends on its
+executable bit works for some people and not others. Nothing here depends on
+it, and the verifier asserts that.
 
 ```
 Judged: https://example.com/
@@ -160,7 +166,7 @@ check that fails a build over a version string is a check somebody switches off.
 To judge a response you already have, without making any request:
 
 ```bash
-./scripts/judge-headers.sh response.headers --url https://example.com/
+bash scripts/judge-headers.sh response.headers --url https://example.com/
 ```
 
 `Server: cloudflare` is not a finding. `Server: Apache/2.4.41` is. The first
