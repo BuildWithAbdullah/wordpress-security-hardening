@@ -3,7 +3,7 @@
  * Plugin Name:  Disable XML-RPC Authentication
  * Description:  Closes the XML-RPC authentication surface, including the
  *               multicall amplification that makes it useful for brute force.
- * Version:      1.0.0
+ * Version:      2.0.0
  * Author:       Abdullah Shabbir
  * License:      MIT
  *
@@ -38,6 +38,17 @@
 
 if ( ! defined( 'ABSPATH' ) ) {
 	exit;
+}
+
+/**
+ * Refuse XML-RPC authentication.
+ *
+ * Leave the whole file inert by defining this in wp-config.php, which is
+ * easier to reason about than deleting a must-use plugin and remembering why:
+ *   define( 'WPSH_KEEP_XMLRPC', true );
+ */
+if ( defined( 'WPSH_KEEP_XMLRPC' ) && WPSH_KEEP_XMLRPC ) {
+	return;
 }
 
 /** Refuse XML-RPC authentication. */
@@ -79,12 +90,28 @@ add_filter(
 add_action(
 	'xmlrpc_call',
 	function ( $method ) {
-		if ( 'pingback.ping' === $method ) {
+		if ( in_array( $method, array( 'pingback.ping', 'system.multicall' ), true ) ) {
 			wp_die(
-				'Pingback is disabled on this site.',
-				'Pingback disabled',
+				'This XML-RPC method is disabled on this site.',
+				'Method disabled',
 				array( 'response' => 403 )
 			);
 		}
+	}
+);
+
+/**
+ * Stop the site making pingback requests of its own.
+ *
+ * Removing the inbound method closes the reflection surface. It does not stop
+ * WordPress sending pingbacks outward when a post is published, which is a
+ * separate feature and a separate outbound request to a URL taken from post
+ * content. Leaving it on is how a site ends up making requests somebody else
+ * chose, long after the inbound endpoint was closed.
+ */
+add_filter(
+	'pre_option_default_pingback_flag',
+	function () {
+		return '0';
 	}
 );
