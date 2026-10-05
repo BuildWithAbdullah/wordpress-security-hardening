@@ -2,104 +2,95 @@
 #
 # check-headers.sh
 #
-# Verify that security headers are actually being sent in production. Deploying
-# a header and never checking the live response is a common and embarrassing
-# gap: PHP-level headers are silently absent on responses served from a
-# full-page cache that bypasses PHP, and on static assets served directly by
-# the web server.
+# Fetch a URL and judge its security headers. Exit code is 0 when nothing
+# failed and 1 otherwise, so it works as a post-deploy check in CI.
 #
 #   ./check-headers.sh https://example.com
+#   ./check-headers.sh https://example.com --json
+#   ./check-headers.sh https://example.com --save dump.headers
 #
-# Exit code is 0 when every required header is present, 1 otherwise, so it can
-# be used as a post-deploy check in CI.
+# This script collects. scripts/judge-headers.sh decides. Everything that could
+# be wrong about a verdict lives in the other file, which needs no network and
+# is driven by the test suite against saved dumps.
+#
+# Deploying a header and never checking the live response is a common and
+# embarrassing gap: PHP-level headers are silently absent on responses served
+# from a full-page cache that bypasses PHP, and on static assets served
+# directly by the web server.
 
 set -u
 
-URL="${1:-}"
-if [ -z "$URL" ]; then
-  echo "usage: $0 <url>" >&2
+usage() {
+  echo "usage: $0 <url> [--json] [--save <file>]" >&2
+  exit 2
+}
+
+URL=""
+SAVE=""
+PASS_THROUGH=()
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --json) PASS_THROUGH+=( "--json" ) ;;
+    --save) shift; [ $# -gt 0 ] || usage; SAVE="$1" ;;
+    -h|--help) usage ;;
+    -*) echo "unknown option: $1" >&2; usage ;;
+    *)  [ -z "$URL" ] || usage; URL="$1" ;;
+  esac
+  shift
+done
+
+[ -n "$URL" ] || usage
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+JUDGE="$HERE/judge-headers.sh"
+
+if [ ! -x "$JUDGE" ]; then
+  echo "cannot find an executable judge-headers.sh next to this script" >&2
   exit 2
 fi
 
-GREEN=$'\033[32m'; RED=$'\033[31m'; YEL=$'\033[33m'; DIM=$'\033[2m'; OFF=$'\033[0m'
+command -v curl >/dev/null 2>&1 || { echo "curl is required" >&2; exit 2; }
 
-# Follow redirects, because a site that redirects http to https must be checked
-# at its final destination.
-HEADERS="$(curl -sSIL --max-time 20 "$URL" 2>/dev/null | tr -d '\r')"
+DUMP="$(mktemp)"
+META="$(mktemp)"
+cleanup() { [ -n "$SAVE" ] && cp "$DUMP" "$SAVE"; rm -f "$DUMP" "$META"; }
+trap cleanup EXIT
 
-if [ -z "$HEADERS" ]; then
-  echo "${RED}Could not fetch ${URL}${OFF}" >&2
+# One request, GET, following redirects.
+#
+# Two things here were wrong in version 1 and both produced a confidently wrong
+# answer rather than an error.
+#
+# It used -I, a HEAD request. A CDN or a host that answers HEAD from a different
+# path, or rejects it with 405, returns a header set the visitor never sees, so
+# headers that are sent on a real page were reported missing. -o /dev/null with
+# a GET costs a body download and removes the whole class of problem.
+#
+# And it made two separate requests, one for the headers and one to learn the
+# effective URL. The HSTS decision was therefore made about a response that was
+# not necessarily the response being judged. One request now yields both: -D
+# writes the headers of every hop, -w reports where it ended up.
+if ! curl -sSL -X GET -o /dev/null -D "$DUMP" \
+     -w '%{url_effective}\n%{http_code}\n' \
+     --max-time 25 "$URL" > "$META" 2>/dev/null; then
+  echo "Could not fetch ${URL}" >&2
   exit 1
 fi
 
-FINAL_URL="$(curl -sSL -o /dev/null -w '%{url_effective}' --max-time 20 "$URL" 2>/dev/null)"
-echo "Checked: ${FINAL_URL}"
-echo
+FINAL_URL="$(sed -n '1p' "$META")"
+STATUS="$(sed -n '2p' "$META")"
 
-fail=0
+if [ ! -s "$DUMP" ]; then
+  echo "Fetched ${URL} but received no headers" >&2
+  exit 1
+fi
 
-get_header() {
-  echo "$HEADERS" | grep -i "^$1:" | tail -1 | cut -d: -f2- | sed 's/^ *//'
-}
-
-require() {
-  local name="$1" expected="${2:-}"
-  local value
-  value="$(get_header "$name")"
-
-  if [ -z "$value" ]; then
-    echo "${RED}MISSING${OFF}  $name"
-    fail=1
-    return
-  fi
-
-  if [ -n "$expected" ] && ! echo "$value" | grep -qi "$expected"; then
-    echo "${YEL}CHECK${OFF}    $name: $value"
-    echo "         ${DIM}expected to contain: $expected${OFF}"
-    return
-  fi
-
-  echo "${GREEN}OK${OFF}       $name: $value"
-}
-
-advise() {
-  local name="$1"
-  local value
-  value="$(get_header "$name")"
-  if [ -z "$value" ]; then
-    echo "${DIM}ABSENT   $name (optional, see docs/01-security-headers.md)${OFF}"
-  else
-    echo "${GREEN}OK${OFF}       $name: $value"
-  fi
-}
-
-require "X-Content-Type-Options" "nosniff"
-require "X-Frame-Options"
-require "Referrer-Policy"
-require "Permissions-Policy"
-
-case "$FINAL_URL" in
-  https://*) require "Strict-Transport-Security" "max-age" ;;
-  *)         echo "${YEL}CHECK${OFF}    Strict-Transport-Security skipped: final URL is not HTTPS" ; fail=1 ;;
+# A header set from an error page is not the header set of the site, and
+# judging it produces findings about a page nobody visits.
+case "$STATUS" in
+  2*) : ;;
+  *)  echo "Warning: final response status is ${STATUS}, so these headers may be an error page's." >&2 ;;
 esac
 
-advise "Content-Security-Policy"
-
-echo
-echo "Headers that should NOT be present:"
-for leak in "X-Powered-By" "X-Pingback" "Server"; do
-  value="$(get_header "$leak")"
-  if [ -n "$value" ]; then
-    echo "${YEL}LEAK${OFF}     $leak: $value"
-  else
-    echo "${GREEN}OK${OFF}       $leak absent"
-  fi
-done
-
-echo
-if [ "$fail" -eq 0 ]; then
-  echo "${GREEN}All required headers present.${OFF}"
-else
-  echo "${RED}One or more required headers missing.${OFF}"
-fi
-exit "$fail"
+exec "$JUDGE" "$DUMP" --url "$FINAL_URL" ${PASS_THROUGH[@]+"${PASS_THROUGH[@]}"}
