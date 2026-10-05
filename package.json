@@ -1,0 +1,34 @@
+{
+  "name": "wordpress-security-hardening",
+  "version": "2.0.0",
+  "private": true,
+  "description": "WordPress hardening as must-use plugins and a live header check, with every verdict and every hook driven by a test suite that needs no WordPress install, no database and no network.",
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "test": "node --test test/catalogue.test.mjs test/headers-plugin.test.mjs test/ip-range.test.mjs test/judge.test.mjs test/login-plugin.test.mjs test/pairs.test.mjs test/php-pairs.test.mjs test/xmlrpc-plugin.test.mjs",
+    "verify": "node tools/verify.mjs",
+    "docs": "node tools/catalogue-doc.mjs",
+    "lint:php": "find mu-plugins lib examples -name '*.php' -print0 | xargs -0 -n1 php -l",
+    "lint:sh": "bash -n scripts/check-headers.sh && bash -n scripts/judge-headers.sh",
+    "check": "npm run lint:php && npm run lint:sh"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "files": [
+    "mu-plugins",
+    "scripts",
+    "docs",
+    "checklists",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "wordpress",
+    "security",
+    "hardening",
+    "security-headers",
+    "xmlrpc"
+  ]
+}
