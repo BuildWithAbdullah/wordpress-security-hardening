@@ -12,7 +12,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        node: ['20', '22', '24']
+        node: ['20.0.0', '22.23.4', '24.11.1']
     name: node ${{ matrix.node }}
     steps:
       - uses: actions/checkout@v7
@@ -20,6 +20,12 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node }}
+
+      # Exact patch versions, in the matrix and in package.json alike.
+      # actions/setup-node resolves a bare major to the newest release of that
+      # line, so a matrix of '20' tests whatever shipped that week rather than
+      # the floor the package declares. tools/verify.mjs fails the build if any
+      # version named anywhere in this file is not all three components.
 
       # PHP is preinstalled on the runner image. The version is printed rather
       # than pinned, because the plugins target PHP 8.x generally and a surprise
@@ -36,9 +42,70 @@ jobs:
 
       - run: npm run check
 
-      # Fails if a finding was added or reworded and the generated document
-      # was not regenerated with it.
-      - run: npm run docs -- --check
+  gates:
+    runs-on: ubuntu-latest
+    name: the gates that are not the suite
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22.23.4'
+
+      # Runs the real scripts the way a person runs them, over every example and
+      # fixture, with the expected exit code derived from the manifests. The
+      # suite drives the judge through a module, which is right and is not a
+      # substitute for running the thing that ships.
+      - run: npm run exit-codes
+
+      # The same idea for the deliverable that has no binary: every audit, in
+      # its own process, with the four expectations derived from one manifest.
+      - run: npm run audit-verdicts
+
+      # Fails if a decision has moved into the one file no test can run.
+      - run: npm run entry-thin
+
+      # Fails if a finding or a limit was added or reworded and the generated
+      # document was not regenerated with it.
+      - run: npm run docs:check
+
+  floor:
+    runs-on: ubuntu-latest
+    name: the declared floor is the version that ran
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '20.0.0'
+
+      # Asserting the floor rather than hoping for it. A job named after a
+      # version proves nothing about which version arrived.
+      - name: Confirm the exact floor is what is running
+        run: |
+          echo "node $(node --version)"
+          node -e 'if (process.version !== "v20.0.0") { console.error("expected v20.0.0, got " + process.version); process.exit(1); }'
+
+      # And that the floor is enforced rather than decorative. The package is
+      # temporarily given a floor nothing can satisfy, and the install has to
+      # refuse it. Checking that the real floor installs on the real floor would
+      # pass whether or not engine-strict does anything at all.
+      - name: Confirm the package refuses to install below its floor
+        run: |
+          cp package.json package.json.real
+          node -e 'const fs=require("fs");const p=JSON.parse(fs.readFileSync("package.json","utf8"));p.engines.node=">=99.0.0";fs.writeFileSync("package.json",JSON.stringify(p,null,2));'
+          if npm install --engine-strict --dry-run > /dev/null 2>&1; then
+            echo "the install succeeded against a floor of >=99.0.0, so engine-strict is doing nothing"
+            mv package.json.real package.json
+            exit 1
+          fi
+          mv package.json.real package.json
+          echo "the install refused a floor this runtime cannot satisfy, as it should"
+
+      # The test command is spelled out rather than run through npm, because the
+      # floor job has already proved which node is on PATH and because a prefix
+      # install of a specific node provides node without npm.
+      - run: npm test
 
   no-dependencies:
     runs-on: ubuntu-latest
@@ -48,12 +115,16 @@ jobs:
 
       - uses: actions/setup-node@v7
         with:
-          node-version: '20'
+          node-version: '20.0.0'
 
       # The repository claims the plugins have no dependencies and the suite
       # needs nothing installed. Asserting it beats stating it: npm ci on a
       # repository with no lockfile and no dependencies should be a no-op, and
       # the suite has to run straight from a clean checkout.
+      #
+      # A tracked lockfile would also carry npm's own copy of the engines field,
+      # and npm ci reads the lockfile rather than package.json, so the two can
+      # promise different floors while every check passes.
       - name: Confirm there is nothing to install
         run: |
           if [ -f package-lock.json ]; then
