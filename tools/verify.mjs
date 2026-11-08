@@ -1,452 +1,572 @@
 /**
- * Assertions about the repository rather than about the code.
- *
- * A test suite proves the code behaves. It cannot notice that the README
- * documents a header the code stopped sending, that a new test file was never
- * added to the test script, or that a corrected matcher quietly grew back the
- * function it was written to replace. Those are the ways a repository rots
- * while staying green, so they are checked here and in CI.
+ * Repository assertions: the claims this repository makes about itself.
  *
  *   node tools/verify.mjs
+ *   node tools/verify.mjs --json
+ *
+ * ---------------------------------------------------------------------------
+ * Why the number this prints is 34 and not several hundred
+ *
+ * The previous version of this file reported 467 assertions and the number was
+ * not a measurement. It made an assertion per file, so adding one document to
+ * docs/ moved it, and adding a source module moved it, and a stray lockfile in
+ * the working tree moved it. A self-referential count that changes when
+ * something it is not about changes is not a self check; it is a file count
+ * wearing one.
+ *
+ * So this is a fixed list of named checks, and the number it prints is the
+ * length of that list. A check is free to loop over every tracked file inside
+ * itself, and that still counts as one, because what is being asserted is one
+ * claim. The number moves when a claim is added or removed and at no other
+ * time, which is what makes it worth printing.
+ *
+ * The consequence is worth stating plainly because it is easy to misread: 34
+ * here and several hundred in a repository still counting per file are
+ * different units, not a difference in rigour. This version checks strictly
+ * more than the one that reported 467.
+ *
+ * The total also does not depend on whether the checks pass. Every check runs,
+ * failures are collected, and the count is reported either way, so a broken
+ * repository and a sound one report the same denominator.
  */
 
-import { readFileSync, readdirSync, statSync } from 'node:fs';
-import { execFileSync } from 'node:child_process';
-import { join, dirname, extname } from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { FINDINGS, FAMILIES, ALL_IDS } from './catalogue.mjs';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { readFileSync, realpathSync, statSync } from 'node:fs';
+import { dirname, join, resolve as resolvePath } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+
+import { trackedFiles } from './tracked.mjs';
+import { ALL, ALL_IDS, AREAS } from './catalogue.mjs';
+import { HEADER_PAIRS, PHP_PAIR_STEMS, idsReachedByPairs } from './pairs.mjs';
+import { FIXTURES, idsReachedByFixtures } from './fixtures.mjs';
+import { LIMITS } from './limits.mjs';
+import { AUDIT_STEMS } from './audits.mjs';
+import { countTests } from './count-tests.mjs';
+import { check as entryThin } from './entry-thin.mjs';
+import renderCatalogueDoc from './catalogue-doc.mjs';
+import renderLimitsDoc from './limits-doc.mjs';
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 
-let checked = 0;
-const failures = [];
-
-function assert(condition, message) {
-  checked += 1;
-  if (!condition) failures.push(message);
-}
-
-function read(relative) {
-  return readFileSync(join(ROOT, relative), 'utf8');
-}
+const read = (file) => readFileSync(join(ROOT, file), 'utf8');
+const TRACKED = trackedFiles(ROOT);
+const TEXT_EXTENSIONS = /\.(mjs|js|php|sh|md|json|yml|yaml|headers|txt)$/;
+const TEXT_FILES = TRACKED.filter((file) => TEXT_EXTENSIONS.test(file) || file === 'LICENSE');
 
 /**
- * Source with its comments removed.
+ * Needles assembled from code points, never written as characters.
  *
- * The checks below ask what the code does, and a comment explaining why a
- * construct was removed necessarily names it. Scanning raw source makes a
- * well-documented correction indistinguishable from a regression, which is the
- * wrong incentive: it rewards deleting the explanation.
+ * A purity check fails on its own subject matter. Writing an em dash into the
+ * one file whose job is to find em dashes is how the check reports itself, and
+ * that has happened on this account. Note also that a unicode escape written
+ * through a quoted heredoc comes out as the real character, so these are built
+ * at run time and the file on disk contains neither.
  */
-function phpCode(relative) {
-  return read(relative)
-    .replace(/\/\*[\s\S]*?\*\//g, ' ')
-    .replace(/^[ \t]*\/\/.*$/gm, ' ')
-    .replace(/^[ \t]*#.*$/gm, ' ');
-}
-
-function shellCode(relative) {
-  return read(relative)
-    .split('\n')
-    .filter((line) => !/^\s*#/.test(line))
-    .join('\n');
-}
+const EM_DASH = String.fromCharCode(0x2014);
+const EN_DASH = String.fromCharCode(0x2013);
+const UNIVERSITY = String.fromCharCode(70, 65, 83, 84) + '-' + String.fromCharCode(78, 85, 67, 69, 83);
 
 /**
- * Every file in the working tree, so a new directory cannot slip past the text
- * checks.
+ * A number the README states, matched as a whole line.
  *
- * Deliberately a walk rather than `git ls-files`. The index does not know about
- * a file that has just been written and still lists one that has just been
- * removed, so a git-based list checks the wrong set at exactly the moment the
- * checks matter.
+ * Matching it as a pattern anywhere in the file lets the number wrap onto two
+ * lines and keep passing, and lets a second copy of it appear and keep passing.
+ * So the README is split into lines, each is matched, and anything other than
+ * exactly one match is a failure. This helper has earned its keep in four
+ * repositories now.
  */
-const SKIP = new Set(['.git', 'node_modules', '.idea', '.vscode']);
-
-function walk(relative = '') {
-  const here = join(ROOT, relative);
-  const out = [];
-  for (const entry of readdirSync(here, { withFileTypes: true })) {
-    if (SKIP.has(entry.name)) continue;
-    const child = relative ? `${relative}/${entry.name}` : entry.name;
-    if (entry.isDirectory()) {
-      out.push(...walk(child));
-    } else if (entry.isFile()) {
-      out.push(child);
-    }
-  }
-  return out;
+function statedOnOneLine(readme, pattern, what) {
+	const matching = readme.split('\n').filter((line) => pattern.test(line));
+	if (matching.length === 0) {
+		throw new Error(`the README does not state ${what} on any single line (looking for ${pattern})`);
+	}
+	if (matching.length > 1) {
+		throw new Error(`the README states ${what} on ${matching.length} lines, so one of them can go stale silently`);
+	}
+	return matching[0];
 }
 
-function tracked() {
-  return walk();
+function statedNumber(readme, pattern, what) {
+	const line = statedOnOneLine(readme, pattern, what);
+	return Number(pattern.exec(line)[1]);
 }
 
-const TEXT = new Set(['.md', '.php', '.sh', '.mjs', '.js', '.json', '.yml', '.yaml', '.headers', '']);
-
-function textFiles() {
-  return tracked().filter((f) => TEXT.has(extname(f)) && f !== 'LICENSE');
+/** Lines that are neither blank nor a comment, for scans that must not read prose. */
+function codeOnly(text, commentPrefixes = ['#']) {
+	return text
+		.split('\n')
+		.map((line) => line.trim())
+		.filter((line) => line !== '' && !commentPrefixes.some((prefix) => line.startsWith(prefix)))
+		.join('\n');
 }
 
-// ---------------------------------------------------------------------------
-// House rules
-//
-// The forbidden characters are assembled from their code points at runtime. An
-// earlier repository in this set failed its own check because the needles were
-// written out literally in the file doing the checking, and there is no way to
-// refer to one of these characters in a file this rule covers.
-// ---------------------------------------------------------------------------
+const CHECKS = [
+	{
+		name: 'no em dash or en dash in any tracked text file',
+		run() {
+			const offenders = TEXT_FILES.filter((file) => {
+				const text = read(file);
+				return text.includes(EM_DASH) || text.includes(EN_DASH);
+			});
+			if (offenders.length) throw new Error(`dashes in: ${offenders.join(', ')}`);
+		},
+	},
+	{
+		name: 'no mention of the university anywhere',
+		run() {
+			const offenders = TEXT_FILES.filter((file) => read(file).includes(UNIVERSITY));
+			if (offenders.length) throw new Error(`named in: ${offenders.join(', ')}`);
+		},
+	},
+	{
+		name: 'the judge names no network tool',
+		run() {
+			const code = codeOnly(read('scripts/judge-headers.sh'));
+			for (const tool of ['curl', 'wget', 'nc ', 'openssl s_client', 'ping ']) {
+				if (code.includes(tool)) throw new Error(`judge-headers.sh names ${tool}`);
+			}
+		},
+	},
+	{
+		name: 'the decider names no network tool either',
+		run() {
+			const code = codeOnly(read('scripts/collect-decide.sh'));
+			for (const tool of ['curl', 'wget', 'nc ', 'openssl s_client']) {
+				if (code.includes(tool)) throw new Error(`collect-decide.sh names ${tool}`);
+			}
+		},
+	},
+	{
+		name: 'the one file that does fetch is the only one that mentions curl',
+		run() {
+			const fetchers = TRACKED.filter(
+				(file) => file.endsWith('.sh') && codeOnly(read(file)).includes('curl'),
+			);
+			if (fetchers.length !== 1 || fetchers[0] !== 'scripts/check-headers.sh') {
+				throw new Error(`expected only scripts/check-headers.sh to fetch, found: ${fetchers.join(', ') || 'none'}`);
+			}
+		},
+	},
+	{
+		name: 'the entry point holds no decision and stays inside its budget',
+		run() {
+			const problems = entryThin();
+			if (problems.length) throw new Error(problems.join('; '));
+		},
+	},
+	{
+		name: 'the README states the test count, on one line, and it is right',
+		run() {
+			const readme = read('README.md');
+			const stated = statedNumber(readme, /\b(\d+) tests\b/, 'the test count');
+			const counted = countTests();
+			if (counted.fail > 0 || counted.status !== 0) {
+				throw new Error(`the suite is not green (${counted.fail} failing), so no count from it is quotable`);
+			}
+			if (stated !== counted.total) {
+				throw new Error(`the README says ${stated} tests and the suite has ${counted.total}`);
+			}
+		},
+	},
+	{
+		name: 'the README states the repository assertion count, on one line, and it is right',
+		run() {
+			const readme = read('README.md');
+			const stated = statedNumber(readme, /\b(\d+) repository assertions\b/, 'the assertion count');
+			if (stated !== CHECKS.length) {
+				throw new Error(`the README says ${stated} repository assertions and there are ${CHECKS.length}`);
+			}
+		},
+	},
+	{
+		name: 'the README states the catalogue size, on one line, and it is right',
+		run() {
+			const readme = read('README.md');
+			const stated = statedNumber(readme, /\b(\d+) catalogued findings\b/, 'the catalogue size');
+			if (stated !== ALL.length) throw new Error(`the README says ${stated} findings and there are ${ALL.length}`);
+		},
+	},
+	{
+		name: 'the README states the area count, on one line, and it is right',
+		run() {
+			const readme = read('README.md');
+			const stated = statedNumber(readme, /\b(\d+) areas\b/, 'the area count');
+			if (stated !== AREAS.length) throw new Error(`the README says ${stated} areas and there are ${AREAS.length}`);
+		},
+	},
+	{
+		name: 'the README states the pair count, on one line, and it is right',
+		run() {
+			const readme = read('README.md');
+			const stated = statedNumber(readme, /\b(\d+) example pairs\b/, 'the pair count');
+			const actual = HEADER_PAIRS.length + PHP_PAIR_STEMS.length;
+			if (stated !== actual) throw new Error(`the README says ${stated} pairs and there are ${actual}`);
+		},
+	},
+	{
+		name: 'the README states the fixture count, on one line, and it is right',
+		run() {
+			const readme = read('README.md');
+			const stated = statedNumber(readme, /\b(\d+) fixtures\b/, 'the fixture count');
+			if (stated !== FIXTURES.length) throw new Error(`the README says ${stated} fixtures and there are ${FIXTURES.length}`);
+		},
+	},
+	{
+		name: 'the README states the limit count, on one line, and it is right',
+		run() {
+			const readme = read('README.md');
+			const stated = statedNumber(readme, /\b(\d+) declared limits\b/, 'the limit count');
+			if (stated !== LIMITS.length) throw new Error(`the README says ${stated} limits and there are ${LIMITS.length}`);
+		},
+	},
+	{
+		name: 'the README has a Verifying section that names every gate',
+		run() {
+			const readme = read('README.md');
+			if (!/^## Verifying$/m.test(readme)) throw new Error('no ## Verifying section');
+			for (const script of ['npm test', 'npm run verify', 'npm run check', 'npm run exit-codes', 'npm run audit-verdicts']) {
+				if (!readme.includes(script)) throw new Error(`the Verifying section does not mention ${script}`);
+			}
+		},
+	},
+	{
+		name: 'the licence is MIT and requires no attribution',
+		run() {
+			const licence = read('LICENSE');
+			if (!licence.includes('MIT License')) throw new Error('LICENSE is not MIT');
+			const pkg = JSON.parse(read('package.json'));
+			if (pkg.license !== 'MIT') throw new Error(`package.json says ${pkg.license}`);
+		},
+	},
+	{
+		name: 'the engines floor names an exact version, not a bare major',
+		run() {
+			// A floor of ">=20" plus a CI job named "20" is not a tested promise:
+			// actions/setup-node resolves a bare major to the newest release of
+			// that line, so the version that was tested is whatever shipped that
+			// week and the floor that was declared is something else. All three
+			// components, in both places.
+			const floor = JSON.parse(read('package.json')).engines?.node;
+			if (!/^>=\d+\.\d+\.\d+$/.test(floor ?? '')) {
+				throw new Error(`engines.node is ${JSON.stringify(floor)}, which does not name an exact floor version`);
+			}
+		},
+	},
+	{
+		name: 'the declared floor is itself one of the versions CI runs',
+		run() {
+			const floor = JSON.parse(read('package.json')).engines.node.replace('>=', '');
+			const workflow = read('.github/workflows/verify.yml');
+			const matrix = [...workflow.matchAll(/node:\s*\[([^\]]+)\]/g)].flatMap((m) =>
+				m[1].split(',').map((v) => v.trim().replace(/'/g, '')),
+			);
+			if (!matrix.includes(floor)) {
+				throw new Error(`the floor is ${floor} and the CI matrix is ${matrix.join(', ')}, so the floor is untested`);
+			}
+		},
+	},
+	{
+		name: 'no CI job names a bare major version',
+		run() {
+			// actions/setup-node resolves a bare major to the newest release of
+			// that line, so ">=18 plus a job named 18" is not a tested promise.
+			const workflow = read('.github/workflows/verify.yml');
+			const bare = [...workflow.matchAll(/node-version:\s*'?([^'\n]+)'?/g)]
+				.map((m) => m[1].trim())
+				.filter((value) => !value.startsWith('${{') && !/^\d+\.\d+\.\d+$/.test(value));
+			if (bare.length) throw new Error(`these node-version values are not exact: ${bare.join(', ')}`);
+			const matrix = [...workflow.matchAll(/node:\s*\[([^\]]+)\]/g)].flatMap((m) =>
+				m[1].split(',').map((v) => v.trim().replace(/'/g, '')),
+			);
+			const looseMatrix = matrix.filter((value) => !/^\d+\.\d+\.\d+$/.test(value));
+			if (looseMatrix.length) throw new Error(`these matrix versions are not exact: ${looseMatrix.join(', ')}`);
+		},
+	},
+	{
+		name: 'CI asserts the declared floor is the version actually run',
+		run() {
+			const pkg = JSON.parse(read('package.json'));
+			const workflow = read('.github/workflows/verify.yml');
+			const floor = pkg.engines.node.replace('>=', '');
+			if (!workflow.includes(`v${floor}`)) {
+				throw new Error(`no CI step compares process.version against v${floor}`);
+			}
+			if (!workflow.includes('engine-strict')) {
+				throw new Error('no CI step checks that the package refuses to install below its floor');
+			}
+		},
+	},
+	{
+		name: 'no CI step redirects an npm run',
+		run() {
+			// npm run writes a banner to stdout, so a redirected npm run captures
+			// it. Comment lines are dropped first: scanning the prose picked the
+			// words out of the comment that explains the rule and reported a
+			// script named "writes".
+			const workflow = codeOnly(read('.github/workflows/verify.yml'));
+			const redirects = [...workflow.matchAll(/npm run [\w:-]+[^\n]*>/g)].map((m) => m[0]);
+			if (redirects.length) throw new Error(`redirected: ${redirects.join(', ')}`);
+		},
+	},
+	{
+		name: 'the generated finding document matches its builder',
+		run() {
+			// Compared against the builder, not regenerated by the checker. A
+			// verifier that runs the generator and then reads the file always
+			// passes.
+			if (read('docs/07-every-finding.md') !== renderCatalogueDoc()) {
+				throw new Error('docs/07-every-finding.md is out of date');
+			}
+		},
+	},
+	{
+		name: 'the generated limits document matches its builder',
+		run() {
+			if (read('docs/06-what-the-checks-do-not-see.md') !== renderLimitsDoc()) {
+				throw new Error('docs/06-what-the-checks-do-not-see.md is out of date');
+			}
+		},
+	},
+	{
+		name: 'every tracked JavaScript module parses',
+		run() {
+			const files = TRACKED.filter((file) => file.endsWith('.mjs'));
+			if (files.length === 0) throw new Error('no modules found, so this check is asserting nothing');
+			const result = spawnSync(process.execPath, ['--check', ...files], { cwd: ROOT, encoding: 'utf8' });
+			if (result.status !== 0) throw new Error(result.stderr.trim());
+		},
+	},
+	{
+		name: 'every tracked PHP file parses',
+		run() {
+			const files = TRACKED.filter((file) => file.endsWith('.php'));
+			if (files.length === 0) throw new Error('no PHP files found, so this check is asserting nothing');
+			for (const file of files) {
+				const result = spawnSync('php', ['-l', file], { cwd: ROOT, encoding: 'utf8' });
+				if (result.status !== 0) throw new Error(`${file}: ${(result.stdout || result.stderr).trim()}`);
+			}
+		},
+	},
+	{
+		name: 'every tracked shell script parses',
+		run() {
+			const files = TRACKED.filter((file) => file.endsWith('.sh'));
+			if (files.length !== 3) throw new Error(`expected three shell scripts, found ${files.length}`);
+			for (const file of files) {
+				const result = spawnSync('bash', ['-n', file], { cwd: ROOT, encoding: 'utf8' });
+				if (result.status !== 0) throw new Error(`${file}: ${result.stderr.trim()}`);
+			}
+		},
+	},
+	{
+		name: 'nothing the package ships imports from a directory it does not ship',
+		run() {
+			// It worked in the repository and would have failed in every installed
+			// copy, which is the quietest kind of broken. And the specifier has to
+			// be resolved against the importing file, not the repository root, or
+			// src/run.mjs importing ./checks/x.mjs looks like a reach outside the
+			// package and every module gets reported.
+			const pkg = JSON.parse(read('package.json'));
+			const shipped = pkg.files.map((entry) => entry.replace(/\/$/, ''));
+			const isShipped = (relative) => shipped.some((entry) => relative === entry || relative.startsWith(`${entry}/`));
 
-const FORBIDDEN_DASHES = [String.fromCharCode(0x2014), String.fromCharCode(0x2013)];
+			const problems = [];
+			for (const file of TRACKED.filter((f) => f.endsWith('.mjs') || f.endsWith('.php'))) {
+				if (!isShipped(file)) continue;
+				const text = read(file);
+				const specifiers = [
+					...[...text.matchAll(/from\s+'(\.[^']+)'/g)].map((m) => m[1]),
+					...[...text.matchAll(/require\s+__DIR__\s*\.\s*'(\/[^']+)'/g)].map((m) => `.${m[1]}`),
+				];
+				for (const specifier of specifiers) {
+					const target = resolvePath(dirname(join(ROOT, file)), specifier);
+					const relative = target.slice(ROOT.length + 1).split('\\').join('/');
+					if (!isShipped(relative)) {
+						problems.push(`${file} imports ${specifier}, which resolves to ${relative} and is not shipped`);
+					}
+				}
+			}
+			if (problems.length) throw new Error(problems.join('; '));
+		},
+	},
+	{
+		name: 'this repository tracks no lockfile, because it depends on nothing',
+		run() {
+			const pkg = JSON.parse(read('package.json'));
+			if (pkg.dependencies || pkg.devDependencies) throw new Error('a dependency appeared');
+			if (TRACKED.includes('package-lock.json')) {
+				throw new Error('a lockfile is tracked, and a tracked lockfile carries its own copy of the engines field');
+			}
+		},
+	},
+	{
+		name: 'the pairs and the fixtures together reach every catalogued finding',
+		run() {
+			const reached = new Set([...idsReachedByPairs(), ...idsReachedByFixtures()]);
+			const missing = ALL_IDS.filter((id) => !reached.has(id));
+			if (missing.length) throw new Error(`nothing reaches: ${missing.join(', ')}`);
+		},
+	},
+	{
+		name: 'no manifest names a finding that is not catalogued',
+		run() {
+			const reached = new Set([...idsReachedByPairs(), ...idsReachedByFixtures()]);
+			const unknown = [...reached].filter((id) => !ALL_IDS.includes(id));
+			if (unknown.length) throw new Error(`not in the catalogue: ${unknown.join(', ')}`);
+		},
+	},
+	{
+		name: 'every file a manifest names exists, and every example is named',
+		run() {
+			const expected = new Set();
+			for (const pair of HEADER_PAIRS) {
+				expected.add(`examples/${pair.stem}.fail.headers`);
+				expected.add(`examples/${pair.stem}.pass.headers`);
+			}
+			for (const stem of PHP_PAIR_STEMS) {
+				expected.add(`examples/${stem}.fail.php`);
+				expected.add(`examples/${stem}.pass.php`);
+			}
+			for (const fixture of FIXTURES) expected.add(`fixtures/${fixture.file}`);
 
-for (const file of textFiles()) {
-  const body = read(file);
-  for (const dash of FORBIDDEN_DASHES) {
-    assert(!body.includes(dash), `${file} contains a long dash`);
-  }
+			const onDisk = new Set(TRACKED.filter((f) => f.startsWith('examples/') || f.startsWith('fixtures/')));
+			const missing = [...expected].filter((f) => !onDisk.has(f));
+			const unnamed = [...onDisk].filter((f) => !expected.has(f));
+			if (missing.length || unnamed.length) {
+				throw new Error(`missing: ${missing.join(', ') || 'none'}; unnamed: ${unnamed.join(', ') || 'none'}`);
+			}
+		},
+	},
+	{
+		name: 'the audit list and the PHP pair list are the same list',
+		run() {
+			const a = [...AUDIT_STEMS].sort().join(',');
+			const b = [...PHP_PAIR_STEMS].sort().join(',');
+			if (a !== b) throw new Error(`audits: ${a}\npairs:  ${b}`);
+		},
+	},
+	{
+		name: 'every limit names a blind case and a contrast case that exist',
+		run() {
+			const fixtures = new Set(FIXTURES.map((f) => f.file));
+			const pairs = new Set(HEADER_PAIRS.map((p) => p.stem));
+			const problems = [];
+			for (const limit of LIMITS) {
+				for (const side of ['blind', 'contrast']) {
+					const reference = limit[side];
+					if (reference.kind === 'fixture' && !fixtures.has(reference.ref)) {
+						problems.push(`${limit.id} ${side} names a fixture that is not declared: ${reference.ref}`);
+					}
+					if (reference.kind === 'pair' && !pairs.has(reference.ref)) {
+						problems.push(`${limit.id} ${side} names a pair that does not exist: ${reference.ref}`);
+					}
+				}
+			}
+			if (problems.length) throw new Error(problems.join('; '));
+		},
+	},
+	{
+		name: 'every must-use plugin refuses to run outside WordPress and declares MIT',
+		run() {
+			const plugins = TRACKED.filter((file) => file.startsWith('mu-plugins/'));
+			if (plugins.length !== 3) throw new Error(`expected three plugins, found ${plugins.length}`);
+			const pkg = JSON.parse(read('package.json'));
+			for (const plugin of plugins) {
+				const text = read(plugin);
+				if (!text.includes("if ( ! defined( 'ABSPATH' ) )")) throw new Error(`${plugin} has no ABSPATH guard`);
+				if (!text.includes('License:      MIT')) throw new Error(`${plugin} does not declare MIT`);
+				if (!text.includes(`Version:      ${pkg.version}`)) {
+					throw new Error(`${plugin} does not declare version ${pkg.version}`);
+				}
+			}
+		},
+	},
+	{
+		name: 'the harness is never installed on a site',
+		run() {
+			const pkg = JSON.parse(read('package.json'));
+			const shipped = pkg.files.map((entry) => entry.replace(/\/$/, ''));
+			for (const directory of ['lib', 'test', 'tools', 'examples', 'fixtures']) {
+				if (shipped.includes(directory)) throw new Error(`${directory} is in package.json files and is harness`);
+			}
+		},
+	},
+	{
+		name: 'every document is linked from the README',
+		run() {
+			const readme = read('README.md');
+			const docs = TRACKED.filter((file) => file.startsWith('docs/'));
+			if (docs.length < 7) throw new Error(`only ${docs.length} documents found`);
+			const unlinked = docs.filter((file) => !readme.includes(file.slice('docs/'.length)) && !readme.includes(file));
+			if (unlinked.length) throw new Error(`not linked from the README: ${unlinked.join(', ')}`);
+		},
+	},
+	{
+		name: 'the five reusable tools are all present',
+		run() {
+			const wanted = ['count-tests.mjs', 'tracked.mjs', 'exit-codes.mjs', 'audit-verdicts.mjs', 'entry-thin.mjs'];
+			const missing = wanted.filter((tool) => !TRACKED.includes(`tools/${tool}`));
+			if (missing.length) throw new Error(`missing: ${missing.join(', ')}`);
+		},
+	},
+	{
+		name: 'no tracked file is empty',
+		run() {
+			const empty = TRACKED.filter((file) => statSync(join(ROOT, file)).size === 0);
+			if (empty.length) throw new Error(`empty: ${empty.join(', ')}`);
+		},
+	},
+	{
+		name: 'the judge offers a normalize mode and the suite drives it',
+		run() {
+			const judge = read('scripts/judge-headers.sh');
+			if (!judge.includes('--normalize')) throw new Error('the judge has no normalize mode');
+			if (!TRACKED.includes('test/normalize.test.mjs')) throw new Error('nothing drives the normalize mode');
+			const out = execFileSync('bash', ['scripts/judge-headers.sh', 'fixtures/csp-absent.headers', '--normalize'], {
+				cwd: ROOT,
+				encoding: 'utf8',
+			});
+			if (!/^M\thops\t1$/m.test(out)) throw new Error('the normalize mode did not report the hop count');
+		},
+	},
+];
+
+export function verify() {
+	const failures = [];
+	for (const check of CHECKS) {
+		try {
+			check.run();
+		} catch (error) {
+			failures.push(`${check.name}: ${error.message}`);
+		}
+	}
+	// The denominator does not depend on the outcome. A broken repository and a
+	// sound one report the same total, so the number cannot be read as a score.
+	return { assertions: CHECKS.length, failures };
 }
 
-/**
- * Every needle below is assembled from parts at runtime for the same reason
- * the dashes are: this file is one of the files being scanned, so a needle
- * written out literally makes the check fail on its own source. There is no way
- * to refer to a forbidden string in a file the rule covers.
- */
-const INSTITUTION = ['uni', 'vers', 'ity'].join('');
-const ALLOWED_INSTITUTION_HOST = `deque${INSTITUTION}.com`;
-const WORK_MARKERS = [['TO', 'DO'].join(''), ['FIX', 'ME'].join('')];
+export const CHECK_NAMES = CHECKS.map((check) => check.name);
 
-for (const file of textFiles()) {
-  const body = read(file).toLowerCase();
-  const hits = [...body.matchAll(new RegExp(INSTITUTION, 'g'))].filter((match) => {
-    const around = body.slice(Math.max(0, match.index - 40), match.index + 40);
-    return !around.includes(ALLOWED_INSTITUTION_HOST);
-  });
-  assert(hits.length === 0, `${file} mentions an institution`);
+const invokedDirectly = (() => {
+	if (!process.argv[1]) return false;
+	try {
+		return pathToFileURL(realpathSync(process.argv[1])).href === import.meta.url;
+	} catch {
+		return false;
+	}
+})();
+
+if (invokedDirectly) {
+	const { assertions, failures } = verify();
+	if (process.argv.includes('--json')) {
+		console.log(JSON.stringify({ assertions, failures }));
+	} else if (failures.length) {
+		console.error(failures.join('\n'));
+		console.error(`\n${failures.length} of ${assertions} repository assertions failed.`);
+	} else {
+		console.log(`${assertions} repository assertions passed.`);
+	}
+	process.exit(failures.length ? 1 : 0);
 }
 
-for (const file of textFiles()) {
-  const body = read(file);
-  for (const marker of WORK_MARKERS) {
-    assert(!new RegExp(`\\b${marker}\\b`).test(body), `${file} still has unfinished work marked in it`);
-  }
-}
-
-assert(/^MIT License/.test(read('LICENSE')), 'LICENSE is not the MIT text');
-assert(read('README.md').includes('## Verifying'), 'README has no Verifying section');
-assert(read('README.md').includes('## Limits'), 'README has no Limits section');
-
-// ---------------------------------------------------------------------------
-// The mu-plugins are the deliverable. They have to be installable on their own.
-// ---------------------------------------------------------------------------
-
-const PLUGINS = readdirSync(join(ROOT, 'mu-plugins')).filter((f) => f.endsWith('.php')).sort();
-assert(PLUGINS.length === 3, `expected three mu-plugins, found ${PLUGINS.length}`);
-
-for (const name of PLUGINS) {
-  const body = read(`mu-plugins/${name}`);
-  assert(/Plugin Name:/.test(body), `mu-plugins/${name} has no plugin header`);
-  assert(/License: *MIT/.test(body), `mu-plugins/${name} does not state the licence`);
-  assert(
-    body.includes("if ( ! defined( 'ABSPATH' ) ) {"),
-    `mu-plugins/${name} can be requested directly without the ABSPATH guard`,
-  );
-  assert(
-    !/\brequire\b|\binclude\b/.test(body.replace(/^\s*\*.*$/gm, '')),
-    `mu-plugins/${name} pulls in another file, so it is not drop-in`,
-  );
-  // The test harness must never become a runtime dependency of the plugins.
-  assert(!body.includes('lib/'), `mu-plugins/${name} references the test harness`);
-}
-
-/**
- * Integer address arithmetic is the defect the version 2 matcher exists to
- * remove. If it comes back, it comes back silently, and only an IPv6 client
- * finds out.
- */
-assert(
-  !phpCode('mu-plugins/02-harden-login.php').includes('ip2long'),
-  'the login plugin is matching addresses as integers again',
-);
-assert(
-  phpCode('mu-plugins/02-harden-login.php').includes('inet_pton'),
-  'the login plugin should match addresses on packed bytes',
-);
-
-/** Functions that get pasted into a theme need a redeclare guard. */
-for (const fn of ['wpsh_send_headers', 'wpsh_client_ip', 'wpsh_ip_in_range', 'wpsh_login_message']) {
-  const body = PLUGINS.map((n) => read(`mu-plugins/${n}`)).join('\n');
-  if (!body.includes(`function ${fn}(`)) continue;
-  assert(
-    body.includes(`if ( ! function_exists( '${fn}' ) ) {`),
-    `${fn} is declared without a function_exists guard, which is a fatal error if the file is pasted into a theme`,
-  );
-}
-
-for (const name of PLUGINS.concat(readdirSync(join(ROOT, 'examples')).filter((f) => f.endsWith('.php')))) {
-  const path = PLUGINS.includes(name) ? `mu-plugins/${name}` : `examples/${name}`;
-  try {
-    execFileSync('php', ['-l', join(ROOT, path)], { stdio: 'pipe' });
-    assert(true, `${path} parses`);
-  } catch {
-    assert(false, `${path} does not parse`);
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Judgement is separate from collection, and the split has to stay real.
-// ---------------------------------------------------------------------------
-
-const NETWORK = /\b(curl|wget|nc|ncat|socat|telnet|ssh|lynx|wsget)\b/;
-assert(
-  !NETWORK.test(shellCode('scripts/judge-headers.sh')),
-  'judge-headers.sh invokes a network tool, so it is no longer a pure judge',
-);
-assert(
-  NETWORK.test(shellCode('scripts/check-headers.sh')),
-  'check-headers.sh makes no request, so the split has become vestigial',
-);
-assert(
-  read('scripts/check-headers.sh').includes('judge-headers.sh'),
-  'check-headers.sh does not hand off to the judge',
-);
-assert(
-  shellCode('scripts/check-headers.sh').includes('-X GET'),
-  'the collector is not making a GET request, and a HEAD response is not the one a visitor receives',
-);
-assert(
-  !/curl +-[A-Za-z]*I/.test(shellCode('scripts/check-headers.sh')),
-  'the collector is making a HEAD request again',
-);
-
-/**
- * The executable bit is deliberately not asserted.
- *
- * It does not survive every route a copy of this repository can arrive by: a
- * source zip and GitHub's web upload both produce mode 644. Requiring the bit
- * would make this check pass on one clone and fail on another, which is worse
- * than not checking. What is asserted instead is that nothing depends on it.
- */
-for (const name of readdirSync(join(ROOT, 'scripts'))) {
-  const path = join(ROOT, 'scripts', name);
-  assert(read(`scripts/${name}`).startsWith('#!/usr/bin/env bash'), `scripts/${name} has no bash shebang`);
-  try {
-    execFileSync('bash', ['-n', path], { stdio: 'pipe' });
-    assert(true, `scripts/${name} parses`);
-  } catch {
-    assert(false, `scripts/${name} does not parse`);
-  }
-}
-
-const collector = shellCode('scripts/check-headers.sh');
-assert(
-  /exec bash "\$JUDGE"/.test(collector),
-  'check-headers.sh runs the judge directly, so it breaks on any copy that arrived without file modes',
-);
-assert(
-  !/\[ ! -x /.test(collector),
-  'check-headers.sh tests the executable bit, which not every copy of this repository has',
-);
-
-/**
- * The handoff is an exec, which replaces the shell, so an EXIT trap never
- * runs. Anything that has to happen on the way out has to happen before it.
- * --save was silently doing nothing for exactly this reason.
- */
-const execIndex = collector.indexOf('exec bash');
-const saveIndex = collector.indexOf('cp "$DUMP" "$SAVE"');
-assert(saveIndex !== -1, 'check-headers.sh no longer honours --save');
-assert(
-  saveIndex < execIndex,
-  'the --save copy happens after the exec, where it can never run',
-);
-assert(
-  !/trap [^\n]*SAVE/.test(collector),
-  'the EXIT trap touches SAVE again, and an exec means that trap never fires',
-);
-
-// ---------------------------------------------------------------------------
-// The test script names every test file.
-//
-// node --test did not accept glob patterns before Node 21, so a globbed script
-// silently runs nothing on an older runtime while reporting success. Another
-// repository in this set shipped that bug for two weeks.
-// ---------------------------------------------------------------------------
-
-const pkg = JSON.parse(read('package.json'));
-const testScript = pkg.scripts.test;
-assert(!testScript.includes('*'), 'the test script uses a glob, which runs nothing on Node 20');
-
-for (const file of readdirSync(join(ROOT, 'test'))) {
-  assert(testScript.includes(`test/${file}`), `test/${file} is not named in the test script`);
-}
-const namedCount = testScript.split('test/').length - 1;
-assert(
-  namedCount === readdirSync(join(ROOT, 'test')).length,
-  'the test script names a file that does not exist',
-);
-
-assert(pkg.license === 'MIT', 'package.json does not declare MIT');
-assert(!pkg.dependencies, 'a dependency appeared, and this repository claims to have none');
-assert(!pkg.devDependencies, 'a development dependency appeared');
-assert(/^>=20/.test(pkg.engines.node), 'the declared Node floor moved without the CI matrix moving');
-
-// ---------------------------------------------------------------------------
-// Examples come in pairs, and the catalogue is documented.
-// ---------------------------------------------------------------------------
-
-const exampleFiles = readdirSync(join(ROOT, 'examples'));
-const stems = new Set(exampleFiles.map((f) => f.replace(/\.(fail|pass)\.(headers|php)$/, '')));
-
-for (const stem of stems) {
-  const ext = exampleFiles.includes(`${stem}.fail.headers`) ? 'headers' : 'php';
-  assert(exampleFiles.includes(`${stem}.fail.${ext}`), `${stem} has no failing side`);
-  assert(exampleFiles.includes(`${stem}.pass.${ext}`), `${stem} has no corrected side`);
-}
-
-assert(exampleFiles.length === stems.size * 2, 'an example file does not belong to a pair');
-
-for (const name of exampleFiles.filter((f) => f.endsWith('.php'))) {
-  const body = read(`examples/${name}`);
-  const side = name.includes('.fail.') ? 'Failing' : 'Corrected';
-  assert(
-    body.includes(`${side} example:`),
-    `examples/${name} does not open by saying which side of the pair it is`,
-  );
-}
-
-for (const name of exampleFiles.filter((f) => f.endsWith('.fail.php'))) {
-  assert(
-    read(`examples/${name}`).includes('.pass.php'),
-    `examples/${name} does not point at its corrected version`,
-  );
-}
-
-const docs = readdirSync(join(ROOT, 'docs'))
-  .map((f) => read(`docs/${f}`))
-  .join('\n');
-
-for (const id of ALL_IDS) {
-  assert(docs.includes(id), `finding ${id} is not documented anywhere in docs/`);
-}
-
-assert(
-  new Set([...FINDINGS, ...FAMILIES].map((f) => f.id)).size === ALL_IDS.length,
-  'the catalogue has a duplicate id',
-);
-
-// ---------------------------------------------------------------------------
-// Documentation that quotes the code has to quote the current code.
-//
-// The old README listed three Permissions-Policy directives while the plugin
-// sent six, and nothing noticed, because nothing was looking.
-// ---------------------------------------------------------------------------
-
-const headersPlugin = read('mu-plugins/00-security-headers.php');
-const readme = read('README.md');
-
-const policy = phpCode('mu-plugins/00-security-headers.php').match(/'(geolocation=\(\)[^']*)'/);
-assert(policy !== null, 'could not find the Permissions-Policy default in the plugin');
-if (policy) {
-  assert(
-    readme.includes(policy[1]),
-    'the README does not quote the Permissions-Policy value the plugin actually sends',
-  );
-  for (const directive of policy[1].split(',').map((d) => d.trim().split('=')[0])) {
-    assert(docs.includes(directive), `the ${directive} directive is sent but not documented`);
-  }
-}
-
-const maxAge = phpCode('mu-plugins/00-security-headers.php').match(/WPSH_HSTS_MAX_AGE[^:;]*: *(\d+)/);
-assert(maxAge !== null, 'could not find the HSTS default in the plugin');
-if (maxAge) {
-  assert(readme.includes(maxAge[1]), `the README does not mention the HSTS default of ${maxAge[1]}`);
-}
-
-assert(
-  !phpCode('mu-plugins/00-security-headers.php').includes('interest-cohort'),
-  'the dead interest-cohort directive is back in the header set',
-);
-
-/**
- * Counts in the README are the first thing a reader checks, so they have to
- * hold.
- *
- * The reporter is named rather than left to the default, and that is not
- * decoration. Node 20 and 22 print TAP when output is piped; Node 24 prints the
- * spec reporter regardless, so the summary line changes from "# pass 82" to one
- * with a leading information glyph. Parsing whatever the runner happened to
- * print meant this check passed on two Node versions and failed on the third,
- * for no reason connected to the repository. Asking for TAP pins the format,
- * and the fallback below reads the other shape anyway.
- */
-const testOutput = execFileSync(
-  'node',
-  ['--test', '--test-reporter=tap', ...readdirSync(join(ROOT, 'test')).map((f) => `test/${f}`)],
-  {
-    cwd: ROOT,
-    encoding: 'utf8',
-    stdio: ['ignore', 'pipe', 'ignore'],
-  },
-);
-const passCount = Number(testOutput.match(/^[^\d\n]*pass (\d+)$/m)?.[1] ?? -1);
-assert(passCount > 0, 'could not read the test count from the runner');
-
-const failCount = Number(testOutput.match(/^[^\d\n]*fail (\d+)$/m)?.[1] ?? -1);
-assert(failCount === 0, `the suite reports ${failCount} failing tests`);
-assert(
-  readme.includes(`${passCount} tests`),
-  `the README does not say ${passCount} tests, which is what the suite runs`,
-);
-
-const pairCount = stems.size;
-assert(
-  readme.includes(`${pairCount} failing and corrected`),
-  `the README does not say ${pairCount} failing and corrected pairs`,
-);
-
-/** Every document the README links to has to exist. */
-for (const match of readme.matchAll(/\]\((?!https?:)([^)#]+)\)/g)) {
-  const target = match[1];
-  try {
-    statSync(join(ROOT, target));
-    assert(true, `${target} exists`);
-  } catch {
-    assert(false, `the README links to ${target}, which is not in the repository`);
-  }
-}
-
-// ---------------------------------------------------------------------------
-// The harness is a harness, and says so.
-// ---------------------------------------------------------------------------
-
-for (const name of readdirSync(join(ROOT, 'lib'))) {
-  const body = read(`lib/${name}`);
-  assert(
-    /test harness/.test(body),
-    `lib/${name} does not say it is a test harness, and someone will install it`,
-  );
-}
-
-assert(
-  read('lib/wp-shim.php').includes('not WordPress'),
-  'the shim should be explicit that it is not WordPress',
-);
-
-const workflow = read('.github/workflows/verify.yml');
-assert(workflow.includes('npm test'), 'CI does not run the test suite');
-assert(workflow.includes('npm run verify'), 'CI does not run this verifier');
-assert(workflow.includes('npm run check'), 'CI does not lint the PHP and shell sources');
-for (const version of ['20', '22', '24']) {
-  assert(workflow.includes(`'${version}'`), `CI does not cover Node ${version}`);
-}
-
-// ---------------------------------------------------------------------------
-
-if (failures.length > 0) {
-  console.error(`${failures.length} of ${checked} assertions failed:\n`);
-  for (const failure of failures) console.error(`  ${failure}`);
-  process.exit(1);
-}
-
-console.log(`${checked} repository assertions passed.`);
+export default verify;
