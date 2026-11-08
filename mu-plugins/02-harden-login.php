@@ -4,7 +4,7 @@
  * Description:  Authentication errors that do not confirm a username, no user
  *               enumeration, and optional restriction of the login form to
  *               known networks.
- * Version:      2.0.0
+ * Version:      3.0.0
  * Author:       Abdullah Shabbir
  * License:      MIT
  *
@@ -36,6 +36,30 @@
  *    refused the login form, with their IPv4 address sitting in the allowlist.
  *    The one failure mode this feature's own comment warns about was built
  *    into it.
+ *
+ * ---------------------------------------------------------------------------
+ * And the one correction in version 3, which was the worst of the lot
+ *
+ * 4. The IP allowlist was bypassable with one request header on any site that
+ *    had switched on proxy support. WPSH_TRUST_PROXY made the lookup read the
+ *    leftmost entry of X-Forwarded-For, and the leftmost entry is whatever the
+ *    client sent. A proxy appends the address it is talking to on the right; it
+ *    does not replace what arrived. So an attacker who sent
+ *
+ *        X-Forwarded-For: 203.0.113.10
+ *
+ *    reached an origin that saw "203.0.113.10, <their real address>" and read
+ *    the first one. The feature whose only job is deciding who is shown a
+ *    login form handed that decision to the person being judged, and the file's
+ *    own comment said proxy headers were only unsafe behind a misconfigured
+ *    proxy. They are unsafe behind a correctly configured one too, which is the
+ *    whole point of the chain being ordered.
+ *
+ *    The fix counts from the other end. WPSH_TRUSTED_PROXY_HOPS says how many
+ *    proxies sit between a visitor and PHP, and the lookup walks that many
+ *    entries in from the right of the chain, where the entries were written by
+ *    machines the site owns. Everything to the left of that is ignored, which
+ *    is where a forged entry can only ever be.
  */
 
 if ( ! defined( 'ABSPATH' ) ) {
@@ -122,7 +146,14 @@ add_action(
 		if ( is_admin() || is_user_logged_in() ) {
 			return;
 		}
-		if ( isset( $_GET['author'] ) || is_author() ) {
+		/**
+		 * An empty author parameter names no author, so there is nothing to
+		 * enumerate and nothing to block. Redirecting on it sent a visitor who
+		 * had arrived at /?author= back to the home page for no reason.
+		 */
+		$asked = isset( $_GET['author'] ) && '' !== trim( (string) $_GET['author'] );
+
+		if ( $asked || is_author() ) {
 			wp_safe_redirect( home_url( '/' ), 302 );
 			exit;
 		}
@@ -188,6 +219,15 @@ add_filter(
  * List the IPv6 range as well as the IPv4 one. A dual-stack client will arrive
  * over whichever the browser and network pick, which is not the one they read
  * off a web page when you asked them for their address.
+ *
+ * Behind a CDN or a reverse proxy, say how many of them there are:
+ *   define( 'WPSH_TRUSTED_PROXY_HOPS', 1 );
+ *
+ * Count the machines between a visitor and PHP, not the ones you can name. One
+ * CDN in front of one origin is 1. A CDN in front of a load balancer in front
+ * of PHP is 2. Getting it too high is the one case this cannot defend against,
+ * because it makes the lookup walk past the entries your own machines wrote and
+ * into the ones the client sent; see wpsh_client_ip().
  */
 add_action(
 	'login_init',
@@ -213,31 +253,88 @@ add_action(
 );
 
 /**
- * Best-effort client address.
+ * The client address, read from the end of the chain the site's own machines
+ * wrote rather than the end the client wrote.
  *
- * REMOTE_ADDR is the only value that cannot be forged by the client. Proxy
- * headers are trusted only when the site has explicitly opted in, because
- * behind a misconfigured proxy X-Forwarded-For is attacker-controlled and any
- * allowlist built on it is decorative.
+ * REMOTE_ADDR is the only value in a request that cannot be forged: it is the
+ * peer the kernel is talking to. Behind a proxy it is the proxy, so the
+ * visitor's address has to come from X-Forwarded-For, and that header is where
+ * version 2 went wrong.
  *
- *   define( 'WPSH_TRUST_PROXY', true );  // only behind a proxy you control
+ * X-Forwarded-For is ordered, oldest first. Each proxy appends the address it
+ * received the request from. So for a visitor C behind one proxy P, the origin
+ * sees REMOTE_ADDR = P and X-Forwarded-For = "C", and the full chain is C then
+ * P. If C sent an X-Forwarded-For of its own, P appends to it rather than
+ * replacing it, and the chain is "<whatever C invented>, C, P". Everything the
+ * client controls is on the left. Everything the site's own machines wrote is
+ * on the right.
+ *
+ * Counting in from the right is therefore the whole fix. With one trusted hop,
+ * the client is the entry one place in from the end, whatever is in front of
+ * it. Version 2 read the leftmost entry, which is the one place in the chain
+ * that is always attacker controlled.
+ *
+ * WPSH_TRUST_PROXY from version 2 is read as one trusted hop, which is what
+ * nearly every site that set it has, so an upgrade keeps working and the
+ * bypass closes. Prefer the explicit count.
+ *
+ * @return string|null The address, or null when it cannot be established.
  */
+if ( ! function_exists( 'wpsh_trusted_proxy_hops' ) ) {
+	function wpsh_trusted_proxy_hops() {
+		if ( defined( 'WPSH_TRUSTED_PROXY_HOPS' ) ) {
+			$hops = (int) WPSH_TRUSTED_PROXY_HOPS;
+			return $hops > 0 ? $hops : 0;
+		}
+		if ( defined( 'WPSH_TRUST_PROXY' ) && WPSH_TRUST_PROXY ) {
+			return 1;
+		}
+		return 0;
+	}
+}
+
 if ( ! function_exists( 'wpsh_client_ip' ) ) {
 	function wpsh_client_ip() {
-		if ( defined( 'WPSH_TRUST_PROXY' ) && WPSH_TRUST_PROXY && ! empty( $_SERVER['HTTP_X_FORWARDED_FOR'] ) ) {
-			$parts     = explode( ',', wp_unslash( $_SERVER['HTTP_X_FORWARDED_FOR'] ) );
-			$candidate = trim( $parts[0] );
-			if ( filter_var( $candidate, FILTER_VALIDATE_IP ) ) {
-				return $candidate;
+		$peer = ! empty( $_SERVER['REMOTE_ADDR'] ) ? trim( wp_unslash( $_SERVER['REMOTE_ADDR'] ) ) : '';
+		$hops = wpsh_trusted_proxy_hops();
+
+		$forwarded = array();
+		if ( $hops > 0 && ! empty( $_SERVER['HTTP_X_FORWARDED_FOR'] ) ) {
+			foreach ( explode( ',', wp_unslash( $_SERVER['HTTP_X_FORWARDED_FOR'] ) ) as $part ) {
+				$part = trim( $part );
+				if ( '' !== $part ) {
+					$forwarded[] = $part;
+				}
 			}
 		}
-		if ( ! empty( $_SERVER['REMOTE_ADDR'] ) ) {
-			$candidate = wp_unslash( $_SERVER['REMOTE_ADDR'] );
-			if ( filter_var( $candidate, FILTER_VALIDATE_IP ) ) {
-				return $candidate;
-			}
+
+		/**
+		 * With no forwarded chain to walk there is nothing to count into, and
+		 * the peer is the visitor. This is the case where a request reaches the
+		 * origin directly, bypassing the CDN, and the peer address is both
+		 * correct and unforgeable.
+		 */
+		if ( ! $forwarded ) {
+			return filter_var( $peer, FILTER_VALIDATE_IP ) ? $peer : null;
 		}
-		return null;
+
+		$chain = array_merge( $forwarded, array( $peer ) );
+		$index = count( $chain ) - 1 - $hops;
+
+		/**
+		 * The chain is shorter than the number of proxies the site says it has.
+		 * Taking the leftmost entry here is exactly the version 2 bug, so
+		 * refuse to answer instead. The caller treats null as "cannot
+		 * establish" and does not lock anybody out, so a wrong hop count is
+		 * loud rather than silently forgeable.
+		 */
+		if ( $index < 0 ) {
+			return null;
+		}
+
+		$candidate = $chain[ $index ];
+
+		return filter_var( $candidate, FILTER_VALIDATE_IP ) ? $candidate : null;
 	}
 }
 

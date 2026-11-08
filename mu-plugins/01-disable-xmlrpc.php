@@ -3,7 +3,7 @@
  * Plugin Name:  Disable XML-RPC Authentication
  * Description:  Closes the XML-RPC authentication surface, including the
  *               multicall amplification that makes it useful for brute force.
- * Version:      2.0.0
+ * Version:      3.0.0
  * Author:       Abdullah Shabbir
  * License:      MIT
  *

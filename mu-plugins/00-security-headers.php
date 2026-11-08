@@ -5,7 +5,7 @@
  *               essentially any WordPress site, on the front end, on the login
  *               page and in the admin. Content Security Policy is deliberately
  *               not included; see docs/01-security-headers.md.
- * Version:      2.0.0
+ * Version:      3.0.0
  * Author:       Abdullah Shabbir
  * License:      MIT
  *
@@ -103,10 +103,22 @@ function wpsh_header_set( $context, $is_ssl ) {
 	 * which addressed a proposal that was abandoned, so it was doing nothing
 	 * except making the header longer and the author look like they had copied
 	 * it from somewhere.
+	 *
+	 * Version 2 included payment=() and that was a defect in a file whose first
+	 * line promises headers that are safe to deploy on essentially any
+	 * WordPress site. payment=() switches off the Payment Request API, which is
+	 * what Apple Pay and Google Pay buttons are built on, so dropping this
+	 * plugin onto a WooCommerce store removed the express checkout and left the
+	 * ordinary card form working. The failure presents as a missing button, not
+	 * an error, and nothing in the file mentioned payment in the list of things
+	 * to check first. It is out of the default. A site with no wallet checkout
+	 * can add it back, and should:
+	 *
+	 *   define( 'WPSH_PERMISSIONS_POLICY', 'geolocation=(), camera=(), microphone=(), payment=(), usb=()' );
 	 */
 	$headers['Permissions-Policy'] = defined( 'WPSH_PERMISSIONS_POLICY' )
 		? WPSH_PERMISSIONS_POLICY
-		: 'geolocation=(), camera=(), microphone=(), payment=(), usb=()';
+		: 'geolocation=(), camera=(), microphone=(), usb=()';
 
 	/**
 	 * HSTS. Only sent over HTTPS, because sending it over HTTP is meaningless
@@ -123,12 +135,28 @@ function wpsh_header_set( $context, $is_ssl ) {
 	 * includeSubDomains is intentionally omitted. It applies to every subdomain
 	 * including ones you may have forgotten, and a staging or legacy subdomain
 	 * still on HTTP will break. Add it only after auditing every subdomain.
+	 *
+	 * Backing it out is the case version 2 got wrong, and it got it wrong in
+	 * the direction that cannot be noticed. Setting the max age to zero made
+	 * version 2 send no header at all, and sending no header does not undo
+	 * HSTS: a browser that has the policy keeps it for the rest of the original
+	 * max age whatever the site does afterwards. The only way to withdraw it is
+	 * to serve max-age=0 and keep serving it until the old policy has expired
+	 * everywhere. So zero now sends the header with zero in it, which is what
+	 * the operator asked for, and scripts/judge-headers.sh reports that as
+	 * hsts/disabled so it cannot be left there by accident.
+	 *
+	 * To send no HSTS header at all, say so separately:
+	 *   define( 'WPSH_HSTS', false );
 	 */
-	if ( $is_ssl ) {
+	$send_hsts = ! defined( 'WPSH_HSTS' ) || WPSH_HSTS;
+
+	if ( $is_ssl && $send_hsts ) {
 		$max_age = defined( 'WPSH_HSTS_MAX_AGE' ) ? (int) WPSH_HSTS_MAX_AGE : 31536000;
-		if ( $max_age > 0 ) {
-			$headers['Strict-Transport-Security'] = 'max-age=' . $max_age;
+		if ( $max_age < 0 ) {
+			$max_age = 0;
 		}
+		$headers['Strict-Transport-Security'] = 'max-age=' . $max_age;
 	}
 
 	/**
@@ -190,8 +218,15 @@ add_action(
 /**
  * wp-admin. admin_init fires before the admin header is rendered.
  *
- * Skipped for AJAX and REST requests, which are served by the admin bootstrap
- * but are not documents, so framing and robots directives are noise on them.
+ * Skipped for AJAX, which runs through wp-admin/admin-ajax.php and so fires
+ * admin_init, but is not a document, so framing and robots directives are noise
+ * on it.
+ *
+ * Version 2's comment here also claimed REST requests were skipped. They are
+ * not served by the admin bootstrap and do not fire admin_init at all, so there
+ * was nothing to skip and the guard never ran for them. A comment that promises
+ * a check nobody wrote is worse than no comment, because the next person reads
+ * it instead of the code.
  */
 add_action(
 	'admin_init',
