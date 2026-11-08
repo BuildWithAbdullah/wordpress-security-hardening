@@ -9,57 +9,67 @@
 #   ./check-headers.sh https://example.com --json
 #   ./check-headers.sh https://example.com --save dump.headers
 #
-# This script collects. scripts/judge-headers.sh decides. Everything that could
-# be wrong about a verdict lives in the other file, which needs no network and
-# is driven by the test suite against saved dumps.
+# This file fetches. collect-decide.sh decides what the fetch produced.
+# judge-headers.sh decides what the headers mean. Neither of those two needs a
+# network, so both are driven by the test suite, and this file is left holding
+# the one thing a test cannot reach: the request itself.
 #
 # Deploying a header and never checking the live response is a common and
 # embarrassing gap: PHP-level headers are silently absent on responses served
 # from a full-page cache that bypasses PHP, and on static assets served
 # directly by the web server.
+#
+# Keep this file thin. tools/entry-thin.mjs fails the build when a decision
+# appears here, because a decision in this file is a decision nothing can test.
 
 set -u
 
-usage() {
-  echo "usage: $0 <url> [--json] [--save <file>]" >&2
-  exit 2
+# Resolve this file through any symlinks before looking for its siblings.
+#
+# dirname of BASH_SOURCE[0] is the directory of the symlink, not of the script,
+# so the obvious one-liner broke the only sensible way to install a shell tool.
+# Put a link to this file on PATH, which is what anybody would do, and every run
+# printed "cannot find collect-decide.sh next to this script" and stopped. It
+# worked from a checkout and failed once installed, which is the quietest kind
+# of broken, and tools/exit-codes.mjs now runs the real script through a
+# deliberately created symlink so it stays fixed.
+resolve_self() {
+  local src dir target
+  src="${BASH_SOURCE[0]}"
+  while [ -L "$src" ]; do
+    dir="$(cd -P "$(dirname "$src")" > /dev/null && pwd)"
+    target="$(readlink "$src")"
+    case "$target" in
+      /*) src="$target" ;;
+      *)  src="$dir/$target" ;;
+    esac
+  done
+  cd -P "$(dirname "$src")" > /dev/null && pwd
 }
 
-URL=""
-SAVE=""
-PASS_THROUGH=()
-
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --json) PASS_THROUGH+=( "--json" ) ;;
-    --save) shift; [ $# -gt 0 ] || usage; SAVE="$1" ;;
-    -h|--help) usage ;;
-    -*) echo "unknown option: $1" >&2; usage ;;
-    *)  [ -z "$URL" ] || usage; URL="$1" ;;
-  esac
-  shift
-done
-
-[ -n "$URL" ] || usage
-
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HERE="$(resolve_self)"
+DECIDE="$HERE/collect-decide.sh"
 JUDGE="$HERE/judge-headers.sh"
 
-if [ ! -r "$JUDGE" ]; then
-  echo "cannot find judge-headers.sh next to this script" >&2
-  exit 2
-fi
+for required in "$DECIDE" "$JUDGE"; do
+  if [ ! -r "$required" ]; then
+    echo "cannot find $(basename "$required") next to this script" >&2
+    exit 2
+  fi
+done
 
 command -v curl >/dev/null 2>&1 || { echo "curl is required" >&2; exit 2; }
 
-DUMP="$(mktemp)"
-META="$(mktemp)"
+WORK="$(mktemp -d)"
+PLAN="$WORK/plan"
+DUMP="$WORK/dump"
+META="$WORK/meta"
+ARGS="$WORK/args"
 
-# The trap only removes the temporary files. Copying the dump out from here
-# would not work: the handoff at the end of this script is an exec, which
-# replaces the shell, so the EXIT trap never runs and --save would quietly do
-# nothing. It is done explicitly before the exec instead.
-trap 'rm -f "$DUMP" "$META"' EXIT
+cleanup() { rm -rf "$WORK"; }
+trap cleanup EXIT
+
+URL="$(bash "$DECIDE" plan "$PLAN" -- "$@")" || exit $?
 
 # One request, GET, following redirects.
 #
@@ -82,25 +92,15 @@ if ! curl -sSL -X GET -o /dev/null -D "$DUMP" \
   exit 1
 fi
 
-FINAL_URL="$(sed -n '1p' "$META")"
-STATUS="$(sed -n '2p' "$META")"
+bash "$DECIDE" finish --plan "$PLAN" --dump "$DUMP" --meta "$META" > "$ARGS" || exit $?
 
-if [ ! -s "$DUMP" ]; then
-  echo "Fetched ${URL} but received no headers" >&2
-  exit 1
-fi
-
-if [ -n "$SAVE" ]; then
-  cp "$DUMP" "$SAVE" || { echo "could not write ${SAVE}" >&2; exit 2; }
-  echo "Saved the response headers to ${SAVE}" >&2
-fi
-
-# A header set from an error page is not the header set of the site, and
-# judging it produces findings about a page nobody visits.
-case "$STATUS" in
-  2*) : ;;
-  *)  echo "Warning: final response status is ${STATUS}, so these headers may be an error page's." >&2 ;;
-esac
+# The dump lives in the temporary directory the trap removes, so the judge has
+# to run before this shell ends. Read the argument list into an array and run
+# it, rather than exec, so the trap still fires.
+JUDGE_ARGS=()
+while IFS= read -r line; do
+  JUDGE_ARGS+=( "$line" )
+done < "$ARGS"
 
 # Invoked through bash rather than executed directly, and the reason is not
 # style. A repository whose files arrive by any route that does not carry file
@@ -108,4 +108,4 @@ esac
 # scripts at mode 644. Depending on the executable bit means the tool is broken
 # for some ways of obtaining it and works for others, which is the worst kind
 # of bug to be told about.
-exec bash "$JUDGE" "$DUMP" --url "$FINAL_URL" ${PASS_THROUGH[@]+"${PASS_THROUGH[@]}"}
+bash "$JUDGE" "${JUDGE_ARGS[@]}"
