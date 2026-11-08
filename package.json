@@ -1,16 +1,21 @@
 {
   "name": "wordpress-security-hardening",
-  "version": "2.0.0",
+  "version": "3.0.0",
   "private": true,
-  "description": "WordPress hardening as must-use plugins and a live header check, with every verdict and every hook driven by a test suite that needs no WordPress install, no database and no network.",
+  "description": "WordPress hardening as must-use plugins and a live header check, with every verdict, every hook and every declared limit driven by a test suite that needs no WordPress install, no database and no network.",
   "type": "module",
   "license": "MIT",
   "scripts": {
-    "test": "node --test test/catalogue.test.mjs test/headers-plugin.test.mjs test/ip-range.test.mjs test/judge.test.mjs test/login-plugin.test.mjs test/pairs.test.mjs test/php-pairs.test.mjs test/xmlrpc-plugin.test.mjs",
+    "test": "node --test test/catalogue.test.mjs test/collect-decide.test.mjs test/fixtures.test.mjs test/headers-plugin.test.mjs test/ip-range.test.mjs test/judge.test.mjs test/limits.test.mjs test/login-plugin.test.mjs test/normalize.test.mjs test/pairs.test.mjs test/php-pairs.test.mjs test/tools.test.mjs test/tracked.test.mjs test/xmlrpc-plugin.test.mjs",
     "verify": "node tools/verify.mjs",
-    "docs": "node tools/catalogue-doc.mjs",
+    "docs": "node tools/catalogue-doc.mjs && node tools/limits-doc.mjs",
+    "docs:check": "node tools/catalogue-doc.mjs --check && node tools/limits-doc.mjs --check",
+    "count": "node tools/count-tests.mjs",
+    "exit-codes": "node tools/exit-codes.mjs",
+    "audit-verdicts": "node tools/audit-verdicts.mjs",
+    "entry-thin": "node tools/entry-thin.mjs",
     "lint:php": "find mu-plugins lib examples -name '*.php' -print0 | xargs -0 -n1 php -l",
-    "lint:sh": "bash -n scripts/check-headers.sh && bash -n scripts/judge-headers.sh",
+    "lint:sh": "bash -n scripts/check-headers.sh && bash -n scripts/collect-decide.sh && bash -n scripts/judge-headers.sh",
     "check": "npm run lint:php && npm run lint:sh"
   },
   "engines": {
@@ -29,6 +34,9 @@
     "security",
     "hardening",
     "security-headers",
-    "xmlrpc"
+    "xmlrpc",
+    "content-security-policy",
+    "hsts",
+    "cookie-security"
   ]
 }

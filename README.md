@@ -7,22 +7,22 @@ Everything here is either installed on a site or driven by a test. The three
 plugins are loaded under a hook registry and their real callbacks fired, so
 every header, every removed XML-RPC method and every branch of the address
 allowlist is asserted on without a WordPress install, a database or a network
-request. The header check is split so that the half which decides anything is a
-pure function of a saved response, and the suite drives every verdict it can
-reach.
+request. The header check is split three ways so that the only file which cannot
+be tested is the one that makes the request, and nothing in it decides anything.
 
-No dependencies. Nothing to install. 82 tests and 14 failing and corrected
-pairs.
+No dependencies. Nothing to install. 183 tests, 38 repository assertions, and
+every finding and every limit reachable from a file in the repository.
 
 ## What it does
 
 | File | What it does |
 |---|---|
-| [`00-security-headers.php`](mu-plugins/00-security-headers.php) | The five headers that are safe on any site, on the front end, on the login page and in the admin, plus version disclosure removal |
+| [`00-security-headers.php`](mu-plugins/00-security-headers.php) | The headers that are safe on any site, on the front end, on the login page and in the admin, plus version disclosure removal |
 | [`01-disable-xmlrpc.php`](mu-plugins/01-disable-xmlrpc.php) | Closes XML-RPC authentication, multicall amplification and pingback reflection, inbound and outbound |
 | [`02-harden-login.php`](mu-plugins/02-harden-login.php) | Authentication errors that do not confirm a username, no author or REST user enumeration, optional network restriction for IPv4 and IPv6 |
-| [`check-headers.sh`](scripts/check-headers.sh) | Fetches a URL and judges what came back |
-| [`judge-headers.sh`](scripts/judge-headers.sh) | Judges a saved response. Makes no request, which is why the suite can drive all of it |
+| [`check-headers.sh`](scripts/check-headers.sh) | Makes one request. Decides nothing, which is why nothing in it needs a test |
+| [`collect-decide.sh`](scripts/collect-decide.sh) | Everything the fetching script used to decide: options, what counts as an unusable response, where `--save` writes |
+| [`judge-headers.sh`](scripts/judge-headers.sh) | Judges a saved response. Makes no request, so the suite drives all of it, including its parser |
 
 Install the plugins into `wp-content/mu-plugins/`. Must-use plugins load
 automatically, cannot be deactivated from the dashboard, and survive theme and
@@ -53,78 +53,155 @@ Each of those is documented here as a decision with its reasoning, because
 "deliberately not done, for this reason" is a finding and "not done" is an
 oversight.
 
-## Six corrections worth reading before you copy any of this
+## Eleven corrections, and the two tests that were asserting the bugs
 
-Version 1 of this repository was fourteen files of prose and three plugins that
-nothing tested. Writing the tests found six defects, and every one of them had
-shipped. They are listed here rather than quietly fixed, because the pattern
+Version 1 was prose and three plugins that nothing tested. Version 2 added the
+tests and found six defects. Version 3 went back over the same files with a
+fixture per reason rather than per header, and found eleven more. Every one of
+them had shipped. They are listed rather than quietly fixed, because the pattern
 each belongs to is more useful than the fix.
 
-**Security headers were sent on the front end only.** One filter on
-`wp_headers`, which is what nearly every guide shows, and it does work. It works
-in `WP::send_headers()` and nowhere else. It does not run on `wp-login.php` and
-it does not run in `wp-admin`, so the two URLs on a WordPress site under
-constant attack received no `X-Frame-Options` and no HSTS from the plugin whose
-job was to send them, and the site passed a header check pointed at its home
-page. The header set is now a pure function of context and all three contexts
-call it. Pair: [`14-headers-frontend-only`](examples/14-headers-frontend-only.fail.php).
+Two of them are worth reading first, because in both cases the defect had a
+passing test requiring it.
 
-**The generic login message replaced every notice, not just failures.**
-`login_errors` carries everything `wp-login.php` renders. A user who clicked Log
-Out was told their password was wrong. So was a user who requested a reset link.
-Both get reported months later as a login bug that nobody connects to a security
-change. Pair:
-[`11-login-errors-unconditional`](examples/11-login-errors-unconditional.fail.php).
+**The address allowlist was bypassable with one request header.** Switching on
+proxy support made the lookup read the leftmost entry of `X-Forwarded-For`, and
+the leftmost entry is whatever the client sent. A proxy appends the address it
+is talking to on the right; it does not replace what arrived. So an attacker who
+sent `X-Forwarded-For: 203.0.113.10` reached an origin that saw
+`203.0.113.10, <their real address>` and read the first one. The feature whose
+only job is deciding who is shown a login form handed that decision to the
+person being judged. The file's own comment said proxy headers were unsafe
+behind a misconfigured proxy; they are unsafe behind a correctly configured one
+too, which is the whole point of the chain being ordered. Version 2 had a test
+named "a trusted proxy chain yields the leftmost address", and it passed. The
+lookup now counts in from the trusted end, and a hop count too high for the
+chain present refuses to answer rather than guessing. Pair:
+[`23-xff-leftmost-trusted`](examples/23-xff-leftmost-trusted.fail.php).
 
-**The address allowlist locked out IPv6 clients.** Built on `ip2long`, like
-every snippet, which returns false for every IPv6 address. An administrator on a
-dual-stack connection, which is most of them, was refused the login form with
-their IPv4 address sitting in the allowlist. The one failure mode the feature's
-own comment warns about was built into it. It now matches on packed bytes, which
-also removes a signed-arithmetic bug that affected any IPv4 address above
-`127.255.255.255` on a 32-bit build. Pair:
-[`13-ip-allowlist-ipv4-only`](examples/13-ip-allowlist-ipv4-only.fail.php).
+**Backing HSTS out sent no header, which does not back it out.** A max age of
+zero is not a deployment, so version 2 omitted the header. HSTS lives in the
+browser: once it has seen the policy it refuses HTTP for the rest of the
+original max age, and nothing the site stops doing changes that. The only way to
+withdraw it is to serve `max-age=0` until the old policy has expired everywhere,
+so the one operator who most needed that header sent was the one version 2
+refused to send it for. Here too a test required the old behaviour and passed.
+Zero now sends zero, and `WPSH_HSTS` set to false is the separate way to send
+nothing. Pair:
+[`25-hsts-backout-omits-header`](examples/25-hsts-backout-omits-header.fail.php).
 
-**The author archive block was a permanent redirect.** 301 is the obvious
-choice, because the intent is permanent. Browsers cache a 301 and stop asking,
-so a client who wants author archives back a year later finds returning visitors
-still cannot reach them and no server-side change fixes it. A hardening measure
-should never be the thing that cannot be undone. Pair:
-[`12-author-redirect-permanent`](examples/12-author-redirect-permanent.fail.php).
+The rest, in short:
 
-**The header check made a HEAD request, and made two requests.** A CDN or host
-that answers HEAD differently, or rejects it with 405, returns a header set no
-visitor ever sees, so headers that were being sent were reported missing. And
-the effective URL was fetched separately from the headers, which meant the HSTS
-decision could be made about a different response than the one being judged. One
-GET now yields both.
+**A duplicate header was judged by reading the last line.** HTTP combines
+repeated field lines into one comma-separated value, so the browser sees neither
+of two conflicting values and the last line is not the one that applies. A
+response sending `max-age=0` and then a year was reported clean while every
+browser switched HSTS off, because RFC 6797 says only the first is processed. A
+response sending `ALLOWALL` and then `SAMEORIGIN` was reported as a pass, and the
+same response with the lines swapped as a failure. Nothing about HTTP makes that
+order meaningful, so the verdict was being decided by luck. Both are now their
+own findings. Pairs: [`15-hsts-duplicated`](examples/15-hsts-duplicated.fail.headers)
+and [`16-x-frame-options-duplicated`](examples/16-x-frame-options-duplicated.fail.headers).
 
-**The header check searched the whole redirect chain.** A header sent on the
-`http` to `https` redirect and absent from the page was reported as present.
-That is now its own finding, `redirect-only`, rather than a pass. Pair:
-[`07-headers-on-redirect-only`](examples/07-headers-on-redirect-only.fail.headers).
+**The hop count was case sensitive behind a case insensitive validity check.** A
+dump whose status lines were lowercase passed validation and then counted as
+zero hops, which merged every hop into one block, so a header sent only on the
+redirect read as present on the final response. That is exactly the finding
+version 2 existed to add, undone by a mismatch between two patterns ten lines
+apart.
 
-Two defaults also changed. Stripping the `ver` query string from stylesheets and
-scripts is now off unless asked for, because it breaks cache busting on every
-deploy in exchange for an obscurity measure the same file describes as not
-security. And `interest-cohort=()` is gone from `Permissions-Policy`, since it
-addressed a proposal that was abandoned and was only making the header longer.
+**Folded header values were invisible.** A value continued on an indented
+following line is one value to every HTTP parser. A policy whose `unsafe-inline`
+sat on the continuation line was reported clean. Pair:
+[`21-folded-policy-hides-inline`](examples/21-folded-policy-hides-inline.fail.headers).
 
-## Examples
+**A quoted `max-age` was reported as a failure.** `max-age="31536000"` is legal
+in RFC 6797 and the browser honours it. Version 2 required bare digits and
+called it unreadable, at error level, which is a working header failing a build.
 
-Fourteen failing and corrected pairs in [`examples/`](examples). Ten are saved
-response headers, four are PHP.
+**A twenty digit `max-age` printed shell errors and then nothing.** Compared with
+shell arithmetic, so `[: integer expression expected` went to stderr twice and
+the run exited 0 with no finding. `max-age` has no upper bound in the
+specification. It is compared on digit length now.
 
-Every pair is held to the same contract by the suite: the check has to be seen
-failing on the failing side and passing on the corrected side, and for the PHP
-pairs it also has to fail against an empty page. A check that has never been
-observed to catch anything is a check that may not work, and the only way to
-find out is to try it. One pair carries an exemption from the empty-page rule
-with the reason written next to it, because with no filter registered the right
-outcome happens for the wrong reason.
+**`X-Powered-By: PHP/8` was reported as clean.** The version check required a
+dotted version. A major version is still a version.
 
-The PHP pairs are also run against the shipped plugin they were drawn from, so
-an example cannot drift from the thing it documents.
+**The default `Permissions-Policy` switched off checkout.** `payment=()`
+disables the Payment Request API, which every wallet checkout button is built
+on, so installing a file whose first line promises headers safe on essentially
+any WordPress site removed the express checkout from any store that installed
+it. Nothing errors, nothing logs, the button is simply not rendered, and it gets
+noticed weeks later by someone comparing conversion rates. The file's list of
+features to check first named geolocation, camera and microphone and did not
+mention payment. Pair:
+[`24-permissions-policy-blocks-payment`](examples/24-permissions-policy-blocks-payment.fail.php).
+
+**Installing the collector on PATH broke it entirely.** It found its siblings
+from `dirname` of `BASH_SOURCE` without following symlinks, so a link on PATH,
+which is the only sensible way to install a shell tool, made every run print
+"cannot find collect-decide.sh next to this script" and stop. It worked from a
+checkout and failed once installed. `tools/exit-codes.mjs` now runs it through a
+deliberately created symlink, which is one `ln -s` and one run.
+
+**A relative `Location` produced a confident wrong verdict.** With no effective
+URL given, version 2 fell back to the dump's own `Location` chain, accepted a
+relative one, decided `/en/` was not HTTPS, and skipped every HSTS check on a
+response that carried a perfectly good HSTS header. Only an absolute URL is
+accepted now, and when there is none the script says so rather than deciding. A
+guess is worse than a refusal when the finding looks specific.
+
+Version 2's own six, briefly: security headers were sent on the front end only,
+so the login page and the admin got none; the generic login message replaced
+every notice rather than only failures; the address allowlist locked out IPv6
+clients because it was built on `ip2long`; the author archive block was a
+permanent redirect and so could not be undone; the header check made a HEAD
+request and made two of them; and it searched the whole redirect chain, so a
+header sent only on the redirect was reported as present.
+
+## One entry per reason
+
+There are 48 catalogued findings across 8 areas, and that structure is the
+reason most of the defects above exist as findings at all.
+
+A catalogue is one entry per reason, not one per check. A header that can be
+absent, present and empty, present with a value that does nothing, or sent twice
+with values that disagree is four entries, because the fix is different in each
+case. Writing a fixture per reason rather than per header is what forced the
+duplicate cases, the folded value, the quoted `max-age` and the cookie prefix
+rules into existence, and three of them turned out to be wrong.
+
+Each entry declares the complete set of severities it can carry, and the suite
+asserts that set in both directions. A severity a real run produces that is not
+declared fails the build, and a severity declared that no test has ever produced
+fails it too. The second direction is the one that does the work: version 2
+declared `weak/strict-transport-security` as a warning while the script emitted
+it as an error when `max-age` was unparsable, so the generated document told a
+reader the run would not fail and the run exited 1.
+
+## Examples and fixtures
+
+There are 25 example pairs in [`examples/`](examples), eighteen of them saved
+response headers and seven PHP. A pair has to be a plausible site, which keeps
+it honest and keeps it from reaching the reasons that only occur one at a time,
+so between them they reach 22 of the catalogued findings. The rest get one of
+the 35 fixtures in [`fixtures/`](fixtures), one per remaining reason.
+
+Every pair declares the exact set of findings its failing side produces and the
+exact set that survives on the corrected side, compared as set equality in both
+directions. Checking only that the headline finding has gone lets a correction
+introduce a second problem and still pass, which is how a repository ships a fix
+that is worse than what it replaced.
+
+Several fixtures declare that they produce nothing, and those earn their keep.
+An empty declaration is an assertion that the script stays quiet about something
+it cannot know: a quoted `max-age` has to be accepted, a session cookie under an
+unrecognised name left alone, a style-only `unsafe-inline` not reported. It is
+the assertion that catches a checker becoming noisier than it should be.
+
+Every PHP pair is also run against the shipped plugin it was drawn from, and
+against an empty page, so an example cannot drift from the thing it documents
+and an audit that is really asking nothing cannot pass.
 
 ## Verify against a live site
 
@@ -147,13 +224,13 @@ Hops in dump: 2
 OK       X-Content-Type-Options       nosniff
 OK       X-Frame-Options              SAMEORIGIN
 OK       Referrer-Policy              strict-origin-when-cross-origin
-OK       Permissions-Policy           geolocation=(), camera=(), microphone=(), payment=(), usb=()
+OK       Permissions-Policy           geolocation=(), camera=(), microphone=(), usb=()
 OK       Strict-Transport-Security    max-age=31536000
 NOTE     Content-Security-Policy      not sent; deliberately optional, see docs/01-security-headers.md
 
 Headers that give away more than they need to:
 WARN     X-Powered-By                 PHP/8.2.4
-OK       Server                       cloudflare (no version)
+NOTE     Server                       cloudflare (names the software, no version)
 OK       X-Pingback                   absent
 
 No failures.
@@ -169,7 +246,14 @@ To judge a response you already have, without making any request:
 bash scripts/judge-headers.sh response.headers --url https://example.com/
 ```
 
-`Server: cloudflare` is not a finding. `Server: Apache/2.4.41` is. The first
+And to see what the judge is about to read, which is where three of the eleven
+defects were:
+
+```bash
+bash scripts/judge-headers.sh response.headers --normalize
+```
+
+`Server: cloudflare` is not a version leak. `Server: Apache/2.4.41` is. The first
 version of this script flagged the header on presence, which meant every site
 behind a CDN got a warning about nothing.
 
@@ -180,47 +264,70 @@ catalogue the suite drives.
 ## Verifying
 
 ```bash
-npm test                  # 82 tests, no WordPress, no database, no network
-npm run verify            # repository assertions
+npm test                  # the suite, no WordPress, no database, no network
+npm run verify            # the claims this repository makes about itself
 npm run check             # php -l and bash -n over every source file
-npm run docs -- --check   # fails if the generated findings document is stale
+npm run exit-codes        # runs the real scripts, exit codes derived from the manifests
+npm run audit-verdicts    # every audit, in its own process, verdicts derived
+npm run entry-thin        # fails if a decision moved into the file nothing can test
+npm run docs:check        # fails if a generated document is stale
+npm run count             # the test count, taken by running them
 ```
 
-Node 20 or newer, and PHP 8 for the plugin tests. Nothing to install: there are
-no dependencies, and CI has a job that fails if a lockfile ever appears.
+Node 20.0.0 or newer, and PHP 8 for the plugin tests. Nothing to install: there
+are no dependencies, and CI has a job that fails if a lockfile ever appears.
 
 **What the tests actually do.** `lib/wp-shim.php` is a hook registry, not a
 WordPress emulator. The suite loads a real mu-plugin under it, fires a real
 hook, and asserts on the real return value. So `login_init` genuinely sends the
 header set, `rest_endpoints` genuinely removes two routes and leaves the rest,
-and the address matcher is driven over a table of thirty-three cases including
-IPv6, non-byte-aligned prefixes, cross-family comparisons and malformed input.
-Each case is a separate PHP process, because a plugin that reads a constant at
+and the address matcher is driven over a table of cases including IPv6,
+non-byte-aligned prefixes, cross-family comparisons and malformed input. Each
+case is a separate PHP process, because a plugin that reads a constant at
 registration time cannot be reconfigured inside one.
 
-`npm run verify` checks the repository rather than the code: that the README
-quotes the `Permissions-Policy` value and HSTS max-age the plugin actually
-sends, that every test file is named in the test script, that
-`judge-headers.sh` still names no network tool, that the login plugin has not
-gone back to integer address arithmetic, and that every documented finding
-exists. A repository can stay green while rotting, and these are the ways it
-does.
+**What the verifier does, and what its number means.** It checks the repository
+rather than the code: that the README quotes counts the code actually produces,
+that every test file is named in the test script, that `judge-headers.sh` still
+names no network tool, that nothing shipped imports from a directory the package
+does not ship, that the engines floor names an exact version and that CI asserts
+the running version is it. A repository can stay green while rotting, and these
+are the ways it does.
 
-CI runs all four commands on Node 20, 22 and 24.
+The number it prints is 38 and not several hundred, and that is deliberate.
+The previous verifier made an assertion per file, so adding one document moved
+the total, and a count that changes when something it is not about changes is a
+file count wearing a self check. It is a fixed list of named claims now. The
+total also does not depend on whether they pass, so it cannot be read as a
+score, and it is not comparable with a number from a verifier still counting per
+file.
+
+CI runs six jobs: the suite on Node 20.0.0, 22.23.4 and 24.11.1, a job that
+fails unless the declared floor is the version that actually ran and that the
+package refuses to install below it, a job for the four gates that are not the
+suite, and a job that fails if anything becomes installable.
 
 ## Limits
 
-[06 What the checks do not see](docs/06-what-the-checks-do-not-see.md) is the
-document to read before quoting any of this to a client, and the short version
-is this: the suite proves the logic in these files is correct and cannot prove
-that WordPress fires these hooks where the plugins assume. That assumption is
-precisely what was wrong in version 1 of the headers plugin. The live check
-against a deployed site is what closes that gap, which is why both exist.
+There are 10 declared limits, generated into
+[06 What the checks do not see](docs/06-what-the-checks-do-not-see.md) from the
+manifest the suite checks. Version 2 declared none at all, which is what made
+this the first thing to fix: a paragraph saying a checker cannot see something
+still reads correctly after the checker learns to see it, and a reader then
+trusts a caveat that is no longer true.
 
-The header check also judges one URL, and headers on a WordPress site are
-frequently not uniform: the home page served from a full-page cache can have a
-different set from an uncached page. Check more than the home page and say which
-you checked.
+Each one names a case nothing is said about, which has to keep producing
+nothing, and a nearby case that is caught, which has to keep producing
+something. A limit that has quietly been fixed fails the build, and so does a
+check that has quietly stopped working.
+
+The short version of all of them: the suite proves the logic in these files is
+correct and cannot prove that WordPress fires these hooks where the plugins
+assume. That assumption is precisely what was wrong in version 1 of the headers
+plugin. The live check against a deployed site is what closes that gap, which is
+why both exist. The live check in turn judges one URL, and headers on a
+WordPress site are frequently not uniform, so check more than the home page and
+say which you checked.
 
 Application-level hardening only. It does not replace a web application
 firewall, a maintained update routine, or off-site backups that have actually
@@ -230,13 +337,14 @@ been restored once.
 
 | Document | What it covers |
 |---|---|
-| [01 Security headers](docs/01-security-headers.md) | The five, where to send them from, why HSTS needs care, and why CSP is usually the wrong call on a page-builder site |
+| [01 Security headers](docs/01-security-headers.md) | Where to send them from, why HSTS needs care, and why CSP is usually the wrong call on a page-builder site |
 | [02 XML-RPC](docs/02-xmlrpc.md) | Why multicall amplification defeats login rate limiting, how to check for legitimate use first, and how to verify it is closed |
 | [03 Login lockout](docs/03-login-lockout.md) | Thresholds worth setting, why rate limiting belongs at the edge, and the 2FA sequence that does not lock the client out |
 | [04 Scan and update workflow](docs/04-scan-workflow.md) | Reading a scan honestly, the four update outcomes, and what a firewall log actually tells you |
 | [05 Compromise recovery](docs/05-incident-response.md) | Order of work, finding the entry point before cleaning, and delisting from blocklists |
-| [06 What the checks do not see](docs/06-what-the-checks-do-not-see.md) | The limits of all of it, per tool, and what is not covered at all |
-| [07 Every finding](docs/07-every-finding.md) | Generated. Every verdict the header judge can reach |
+| [06 What the checks do not see](docs/06-what-the-checks-do-not-see.md) | Generated. Every limit, with the case that demonstrates it and the one that contrasts it |
+| [07 Every finding](docs/07-every-finding.md) | Generated. Every verdict the header judge can reach, with its severity set |
+| [08 Session cookies and caching](docs/08-session-cookies-and-caching.md) | The two areas version 3 added, including the one that hands one visitor another visitor's session |
 | [Hardening checklist](checklists/hardening-checklist.md) | The full engagement in order |
 
 ## Two things worth knowing up front
@@ -261,7 +369,7 @@ a plugin. The header scripts need `bash`, and the collector needs `curl`.
 
 - [wordpress-emergency-recovery](https://github.com/BuildWithAbdullah/wordpress-emergency-recovery) - what to do when hardening came too late
 - [site-audit-cli](https://github.com/BuildWithAbdullah/site-audit-cli) - security as one of four audit domains, with the same catalogue-and-drive approach
-- [site-migration-and-dns](https://github.com/BuildWithAbdullah/site-migration-and-dns) - the same split between a pure judge and the one directory allowed to touch the network
+- [site-migration-and-dns](https://github.com/BuildWithAbdullah/site-migration-and-dns) - the same split between a pure judge and the one file allowed to touch the network
 
 ## Licence
 
