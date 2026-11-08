@@ -1,112 +1,106 @@
 # What the checks do not see
 
-Every other document here describes something the repository can demonstrate.
-This one is the list of things it cannot, and it is the document worth reading
-before quoting any of this back to a client.
+Generated from `tools/limits.mjs` by `npm run docs`. Do not edit by hand.
 
-A hardening report that only contains findings reads as a complete picture of
-the site's security. It is not one, and the gap between those two things is
-where a client's expectations get set wrongly.
+Read this before putting any output from this repository in front of a client.
+A green run means the things listed in
+[07 Every finding](07-every-finding.md) were not found. It does not mean the
+site is fine, and the gap between those two statements is what this page is.
 
-## The header judge
+Every limit below is checked in both directions by `test/limits.test.mjs`.
+Each one names a case the repository says nothing about, which has to keep
+producing nothing, and a nearby case it does catch, which has to keep
+producing something. A limit that has quietly been fixed fails the build, and
+so does a check that has quietly stopped working. Without the second
+direction the prose would read correctly in either case.
 
-`scripts/judge-headers.sh` reads one response. That is a narrower claim than it
-looks.
+There are 10 of them.
 
-**It judges one URL.** Headers on a WordPress site are frequently not uniform.
-The home page is served from a full-page cache that never boots PHP, so a
-PHP-level header is absent there and present on an uncached page such as the
-cart or a logged-in view. The reverse happens too: a CDN adds headers at the
-edge for HTML and not for anything else. Checking the home page and reporting
-"headers are deployed" is wrong on a large share of real sites. Run it against
-an uncached URL as well, and against a static asset, and say which you checked.
+## 1. `session-cookie-names-are-a-fixed-list`
 
-**It cannot see what a header does to the site.** `Permissions-Policy` with
-`geolocation=()` is correct on most sites and breaks a store locator. There is
-no way to tell from the response which kind of site you are looking at. The
-same is true of `X-Frame-Options` on a site whose booking page is deliberately
-embedded in a partner's. The tool reports the header; whether it is the right
-header is a conversation.
+Cookie findings apply only to cookies this repository can name as session or authentication cookies. A site with a custom session cookie name gets nothing said about it.
 
-**HSTS cannot be judged for safety, only for presence.** `max-age=31536000` is
-reported as correct. Whether the certificate renews automatically, whether every
-subdomain is on HTTPS, and whether the client can tolerate a hard failure if the
-certificate lapses are the questions that actually matter, and none of them is
-in a response header. `weak/strict-transport-security` on a short max-age is a
-prompt to ask, not a defect on its own: a short max-age during a staged rollout
-is the correct state to be in.
+**Why it is the right trade.** The alternative is inferring from the absence of attributes, which reports every analytics and consent cookie on every site. A checker that is wrong about most of what it reports is a checker nobody reads.
 
-**`csp/absent` is a note on purpose.** Not deploying a Content Security Policy
-on a page-builder site, and writing down why, is usually the right call. A
-permissive policy full of `unsafe-inline` protects nothing and looks like
-protection, which is why `csp/unsafe-inline` is a finding and absence is not.
+**Demonstrated by.** The case nothing is said about is `cookie-custom-name-is-invisible.headers`, and the nearby case that is caught is `17-session-cookie-unflagged`.
 
-**A `leak/version` finding is noise reduction, not a vulnerability.** Removing a
-version from a header stops some automated scanners that filter by advertised
-version. It does not stop anyone who is actually looking, and it must never be
-reported in a way that implies the underlying component is now up to date.
+## 2. `script-source-list-only`
 
-**`redirect-only` exists because the tooling was wrong, not the site.** Any
-checker that searches a whole redirect chain for a header name reports a pass
-when the header is sent on the hop and not on the page. If you have used
-another tool for this, that is worth testing before trusting it.
+The unsafe-inline and unsafe-eval checks read the script source list, or default-src where there is no script-src. A policy that permits unsafe-inline for styles only is not reported.
 
-## The plugin probe
+**Why it is the right trade.** An inline style is a far smaller problem than an inline script, and most real WordPress policies permit inline styles because the block editor emits them. Reporting those would make the finding worthless.
 
-`lib/wp-shim.php` is a hook registry. It lets the suite load a real mu-plugin,
-fire a real hook and assert on the real return value, with no WordPress, no
-database and no web server. That covers the logic in these files completely and
-leaves one thing uncovered, which is the important one.
+**Demonstrated by.** The case nothing is said about is `csp-style-only-unsafe-inline.headers`, and the nearby case that is caught is `08-csp-unsafe-inline`.
 
-**It cannot prove WordPress fires these hooks where the plugins assume.** The
-suite shows that `login_init` sends the header set. It cannot show that
-WordPress runs `login_init` before output on wp-login.php, because that is
-WordPress's behaviour and not this repository's. That assumption is exactly the
-class of thing that was wrong in version 1 of the headers plugin, where
-`wp_headers` was assumed to cover the login page and does not.
+## 3. `no-directive-interaction-model`
 
-So the suite is necessary and not sufficient. The live check against a deployed
-site is what closes that gap, which is why `scripts/check-headers.sh` exists at
-all and why `## Verifying` in the README tells you to run both.
+The policy checks are lexical. Interactions between directives are not modelled, so strict-dynamic beside a bare scheme source is still reported as permitting any host, which in that policy it does not.
 
-**The shim implements only what the plugins call.** It is not a WordPress
-emulator and adding behaviour to it that no plugin uses would be inventing
-confidence.
+**Why it is the right trade.** Modelling the interactions means implementing the CSP source matching algorithm, and a half-implemented version of it would be confidently wrong rather than noisy. The false positive is declared and has a fixture.
 
-**Capability checks are modelled, not real.** `current_user_can` in the shim
-answers from a list the test supplied. Whether `list_users` is the right
-capability for the REST users route on a particular site, with its particular
-roles and whatever role editor plugin is installed, is a decision the trade-off
-note in `02-harden-login.php` describes and the suite cannot make.
+**Demonstrated by.** The case nothing is said about is `csp-style-only-unsafe-inline.headers`, and the nearby case that is caught is `csp-strict-dynamic-still-reported.headers`.
 
-## The repository verifier
+## 4. `leak-headers-are-a-fixed-list`
 
-`tools/verify.mjs` checks the repository, not a site: that documentation quotes
-the current code, that every test file is actually run, that the pure half of
-the header script has stayed pure, that an example has both sides. It is there
-because a repository can rot while staying green. It says nothing at all about
-whether any of this is deployed anywhere.
+Five header names are inspected for a version. A version in any other header, in a cookie name or in a Link target is not seen.
 
-## What none of it covers
+**Why it is the right trade.** Searching every header for a version-shaped value reports a build number in a cache header on every site behind a CDN. Version 1 of this script flagged Server on presence alone and that is exactly how its output started getting skimmed.
 
-The three mu-plugins and one script here are application-level hardening, and
-that is a slice of the job. Not covered anywhere in this repository, and worth
-saying out loud in any report that cites it:
+**Demonstrated by.** The case nothing is said about is `leak-unlisted-header.headers`, and the nearby case that is caught is `leak-version-major.headers`.
 
-- Updates. Nothing here keeps WordPress, a theme or a plugin current, and an
-  out-of-date component is the way most sites are actually compromised.
-- Backups, and specifically whether a restore has ever been performed. An
-  untested backup is a belief, not a control.
-- A web application firewall, rate limiting, and anything else that has to act
-  before PHP boots. `docs/03-login-lockout.md` says why lockout belongs there
-  and not here.
-- Hosting. Shared hosting with a world-readable `wp-config.php`, an outdated PHP
-  version, or a neighbour account on the same user is a problem no plugin
-  reaches.
-- Credentials and account hygiene. Two-factor enrolment, administrator count,
-  and whether the developer still has access are the findings that come up most
-  and are the least technical.
-- File integrity and whether the site is already compromised.
-  `docs/05-incident-response.md` is the starting point, and
-  [wordpress-emergency-recovery](https://github.com/BuildWithAbdullah/wordpress-emergency-recovery)
-  is the tooling for it.
+## 5. `hsts-needs-an-established-transport`
+
+Nothing is concluded about HSTS unless the final URL is known and is HTTPS. On a plain HTTP response, or when no final URL was given and the dump carries no absolute one, the HSTS header in the dump is deliberately not judged.
+
+**Why it is the right trade.** A browser ignores HSTS over HTTP, so a finding about it would be a confident statement about a header nobody acts on. Version 2 assumed HTTPS when it did not know, which is how it produced HSTS verdicts about a transport nobody had established.
+
+**Demonstrated by.** The case nothing is said about is `transport-url-unknown.headers`, and the nearby case that is caught is `hsts-missing.headers`.
+
+## 6. `one-response-per-run`
+
+One URL is judged per run. Headers are routinely absent on responses the visitor also receives: a page served from a full-page cache that bypasses PHP, and any static asset served directly by nginx or Apache. None of that is visible here.
+
+**Why it is the right trade.** This is the gap the whole repository exists around, and it cannot be closed by a checker that fetches one page. The remedy is in the documentation: send the headers at the server or CDN level where you control it, and check more than the home page.
+
+**Demonstrated by.** The case nothing is said about is `judge-refuses-two-dumps`, and the nearby case that is caught is `judge-reads-only-the-final-hop`.
+
+## 7. `php-headers-cannot-prove-delivery`
+
+The plugins send headers from PHP, and the test suite observes them being sent from PHP. That the client received them is not and cannot be asserted here.
+
+**Why it is the right trade.** Nothing short of a live request proves delivery, which is why scripts/check-headers.sh exists as a separate deliverable. The suite asserts the header set and the hooks; the live check asserts the response.
+
+**Demonstrated by.** The case nothing is said about is `plugins-send-only-through-php-hooks`, and the nearby case that is caught is `header-set-is-observable`.
+
+## 8. `no-rate-limiting`
+
+No login attempt counting, lockout or throttling. mu-plugins/02-harden-login.php covers what code can do about enumeration and about messages that confirm a username, and nothing about volume.
+
+**Why it is the right trade.** Lockout belongs where it can see the request before PHP boots and act across the whole site rather than one endpoint. Implementing it in a must-use plugin means a database write per failed attempt, which is a denial of service surface rather than a defence. See docs/03-login-lockout.md for the thresholds worth setting at the edge.
+
+**Demonstrated by.** The case nothing is said about is `plugins-keep-no-state`, and the nearby case that is caught is `enumeration-is-blocked`.
+
+## 9. `shim-is-not-wordpress`
+
+lib/wp-shim.php fires real hooks against real plugin code and is not WordPress. Anything that depends on load order outside the hooks, on the object cache, on multisite, or on when the current user is determined, is out of reach.
+
+**Why it is the right trade.** A shim that needed a database and a full bootstrap would be a WordPress install, and the suite would then need one to run, which is the thing that stops anybody running it. The trade is stated rather than hidden: these tests prove the plugin logic, not the platform.
+
+**Demonstrated by.** The case nothing is said about is `shim-has-no-database`, and the nearby case that is caught is `shim-fires-real-hooks`.
+
+## 10. `proxy-hop-count-is-trusted`
+
+The allowlist reads the client address by counting in from the trusted end of X-Forwarded-For. A hop count set higher than the number of proxies that really exist makes it read an entry the client could have written.
+
+**Why it is the right trade.** Nothing in a request distinguishes the entry a real proxy wrote from an invented one, so there is no signal left to check. The mitigation is that the count is a deliberate declaration of the topology the site has, and that a count too high for the chain present refuses to answer rather than guessing.
+
+**Demonstrated by.** The case nothing is said about is `overstated-hop-count-reads-a-forged-entry`, and the nearby case that is caught is `correct-hop-count-ignores-a-forged-entry`.
+
+## The one that is not on the list
+
+Hardening is not a state a site reaches. Everything here reduces a surface or
+removes a signal, and none of it substitutes for keeping WordPress, the theme
+and the plugins updated, for having a restore that somebody has actually
+tested, or for knowing who has an administrator account and why. A site with
+every finding in this repository cleared and an out of date plugin is not a
+hardened site.
