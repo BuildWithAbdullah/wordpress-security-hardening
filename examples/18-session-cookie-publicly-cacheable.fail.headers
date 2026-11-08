@@ -1,0 +1,12 @@
+HTTP/2 200
+date: Mon, 03 Nov 2026 10:00:00 GMT
+content-type: text/html; charset=UTF-8
+x-content-type-options: nosniff
+x-frame-options: SAMEORIGIN
+referrer-policy: strict-origin-when-cross-origin
+permissions-policy: geolocation=(), camera=(), microphone=(), usb=()
+strict-transport-security: max-age=31536000
+cache-control: public, max-age=600
+set-cookie: wordpress_sec_9f2c=x; path=/; Secure; HttpOnly; SameSite=Lax
+content-security-policy: default-src 'self'; script-src 'self' https://cdn.example.com
+

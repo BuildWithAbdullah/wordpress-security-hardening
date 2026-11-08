@@ -1,9 +1,9 @@
 HTTP/2 200
-date: Sun, 05 Oct 2026 06:00:00 GMT
+date: Mon, 03 Nov 2026 10:00:00 GMT
 content-type: text/html; charset=UTF-8
 x-frame-options: SAMEORIGIN
 referrer-policy: strict-origin-when-cross-origin
-permissions-policy: geolocation=(), camera=(), microphone=(), payment=(), usb=()
+permissions-policy: geolocation=()
 strict-transport-security: max-age=31536000
-server: cloudflare
+content-security-policy: default-src 'self'; script-src 'self' https://cdn.example.com
 
