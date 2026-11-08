@@ -1,0 +1,9 @@
+HTTP/2 200
+date: Mon, 03 Nov 2026 10:00:00 GMT
+content-type: text/html; charset=UTF-8
+x-content-type-options: nosniff
+referrer-policy: strict-origin-when-cross-origin
+permissions-policy: geolocation=()
+strict-transport-security: max-age=31536000
+content-security-policy: default-src 'self'; script-src 'self'
+

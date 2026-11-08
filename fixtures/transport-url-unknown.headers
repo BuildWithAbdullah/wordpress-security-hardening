@@ -1,0 +1,11 @@
+HTTP/1.1 301 Moved Permanently
+location: /en/
+
+HTTP/2 200
+x-content-type-options: nosniff
+x-frame-options: SAMEORIGIN
+referrer-policy: strict-origin-when-cross-origin
+permissions-policy: geolocation=()
+strict-transport-security: max-age=31536000
+content-security-policy: default-src 'self'; script-src 'self'
+
