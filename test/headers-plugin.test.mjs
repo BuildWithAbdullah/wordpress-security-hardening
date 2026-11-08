@@ -94,23 +94,91 @@ test('HSTS is sent only over HTTPS, in every context', () => {
   }
 });
 
-test('the HSTS max-age can be staged down, and zero means do not send it', () => {
+test('the HSTS max-age can be staged down', () => {
   const short = probe({
     load: [PLUGIN],
     constants: { WPSH_HSTS_MAX_AGE: 300 },
     ops: [{ op: 'call', fn: 'wpsh_header_set', args: ['frontend', true] }],
   });
   assert.equal(short.results['0'].value['Strict-Transport-Security'], 'max-age=300');
+});
 
+/**
+ * Version 2 had a test here requiring a max age of zero to omit the header, and
+ * it passed. It was asserting the defect, the same way the allowlist test in
+ * test/ip-range.test.mjs was.
+ *
+ * HSTS lives in the browser, not in the response. Sending nothing does not undo
+ * it: a browser that has the policy keeps it for the rest of the original max
+ * age whatever the site stops doing. Withdrawing it means serving max-age=0 and
+ * continuing to serve it until the old policy has expired everywhere, so the one
+ * operator who most needs that header sent was the one version 2 refused to send
+ * it for.
+ */
+test('a max age of zero sends the back-out header rather than nothing', () => {
   const off = probe({
     load: [PLUGIN],
     constants: { WPSH_HSTS_MAX_AGE: 0 },
     ops: [{ op: 'call', fn: 'wpsh_header_set', args: ['frontend', true] }],
   });
-  assert.ok(
-    !('Strict-Transport-Security' in off.results['0'].value),
-    'max-age=0 should omit the header rather than send a value that switches HSTS off',
+  assert.equal(
+    off.results['0'].value['Strict-Transport-Security'],
+    'max-age=0',
+    'zero is the withdrawal value and has to be sent for the withdrawal to happen',
   );
+});
+
+test('a negative max age is clamped to the back-out value', () => {
+  const out = probe({
+    load: [PLUGIN],
+    constants: { WPSH_HSTS_MAX_AGE: -1 },
+    ops: [{ op: 'call', fn: 'wpsh_header_set', args: ['frontend', true] }],
+  });
+  // A negative max age has no meaning, and the nearest thing the operator can
+  // have meant is the back-out.
+  assert.equal(out.results['0'].value['Strict-Transport-Security'], 'max-age=0');
+});
+
+test('not sending HSTS at all is a separate, explicit choice', () => {
+  const out = probe({
+    load: [PLUGIN],
+    constants: { WPSH_HSTS: false },
+    ops: [{ op: 'call', fn: 'wpsh_header_set', args: ['frontend', true] }],
+  });
+  assert.ok(
+    !('Strict-Transport-Security' in out.results['0'].value),
+    'WPSH_HSTS false is the way to send no header, now that zero means withdraw',
+  );
+});
+
+test('the default Permissions-Policy restricts no payment or wallet feature', () => {
+  const out = probe({
+    load: [PLUGIN],
+    ops: [{ op: 'call', fn: 'wpsh_header_set', args: ['frontend', true] }],
+  });
+  const value = out.results['0'].value['Permissions-Policy'];
+  assert.ok(typeof value === 'string' && value.length > 0);
+  // payment=() switches off the Payment Request API, which every wallet
+  // checkout button is built on. Version 2 had it in the default, so installing
+  // this file on a store removed the express checkout and left the card form
+  // working, which looks like a theme bug and gets noticed weeks later.
+  assert.ok(
+    !/(^|[,\s])payment\s*=\s*\(\s*\)/i.test(value),
+    `the default must not disable payment: ${value}`,
+  );
+  // And it still restricts the things whose absence costs nothing.
+  for (const feature of ['geolocation', 'camera', 'microphone']) {
+    assert.ok(value.includes(`${feature}=()`), `${feature} should still be restricted by default`);
+  }
+});
+
+test('a site with no wallet checkout can restrict payment deliberately', () => {
+  const out = probe({
+    load: [PLUGIN],
+    constants: { WPSH_PERMISSIONS_POLICY: 'geolocation=(), payment=()' },
+    ops: [{ op: 'call', fn: 'wpsh_header_set', args: ['frontend', true] }],
+  });
+  assert.equal(out.results['0'].value['Permissions-Policy'], 'geolocation=(), payment=()');
 });
 
 test('includeSubDomains is not sent, because it breaks subdomains nobody audited', () => {

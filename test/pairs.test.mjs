@@ -1,90 +1,115 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readdirSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { judgeFile, ids, ROOT } from '../tools/judge.mjs';
+import { judgeFile, ROOT } from '../tools/judge.mjs';
+import { HEADER_PAIRS, PHP_PAIR_STEMS, expectedExit } from '../tools/pairs.mjs';
 
 const EXAMPLES = join(ROOT, 'examples');
-const URL = 'https://example.test/';
+
+/** The findings a run produced, as `level:id`, sorted and deduplicated. */
+function entries(path, url) {
+	const result = judgeFile(path, url ? { url } : {});
+	return [...new Set(result.findings.map((f) => `${f.level}:${f.id}`))].sort();
+}
+
+test('every headers fixture on disk belongs to a declared pair', () => {
+	const stems = new Set(
+		readdirSync(EXAMPLES)
+			.filter((name) => name.endsWith('.headers'))
+			.map((name) => name.replace(/\.(fail|pass)\.headers$/, '')),
+	);
+	assert.deepEqual([...stems].sort(), HEADER_PAIRS.map((p) => p.stem).sort());
+});
+
+test('every example file on disk belongs to a declared pair', () => {
+	const declared = new Set();
+	for (const pair of HEADER_PAIRS) {
+		declared.add(`${pair.stem}.fail.headers`);
+		declared.add(`${pair.stem}.pass.headers`);
+	}
+	for (const stem of PHP_PAIR_STEMS) {
+		declared.add(`${stem}.fail.php`);
+		declared.add(`${stem}.pass.php`);
+	}
+	assert.deepEqual(readdirSync(EXAMPLES).sort(), [...declared].sort());
+});
 
 /**
- * The finding each header pair exists to demonstrate.
+ * Set equality, both ways, on both sides of every pair.
  *
- * A pair is only worth shipping if the corrected side is provably corrected,
- * which means the same check has to be seen failing on the other side. A
- * repository full of checks that have never caught anything is a repository
- * whose checks may not work.
+ * Checking only that the headline finding has gone on the corrected side lets a
+ * correction introduce a second problem and still pass, which is how a
+ * repository ends up shipping a fix that is worse than the thing it replaced.
+ * So the failing side declares exactly what it produces and the corrected side
+ * declares exactly what survives.
  */
-const PAIRS = {
-  '01-x-frame-options-permissive': 'weak/x-frame-options',
-  '02-nosniff-missing': 'missing/x-content-type-options',
-  '03-referrer-policy-unsafe': 'weak/referrer-policy',
-  '04-permissions-policy-empty': 'weak/permissions-policy',
-  '05-hsts-staging-max-age': 'weak/strict-transport-security',
-  '06-hsts-disabled': 'disabled/strict-transport-security',
-  '07-headers-on-redirect-only': 'redirect-only',
-  '08-csp-unsafe-inline': 'csp/unsafe-inline',
-  '09-version-disclosure': 'leak/version',
-  '10-pingback-advertised': 'leak/pingback',
-};
-
-test('every header fixture on disk belongs to a declared pair', () => {
-  const stems = new Set(
-    readdirSync(EXAMPLES)
-      .filter((name) => name.endsWith('.headers'))
-      .map((name) => name.replace(/\.(fail|pass)\.headers$/, '')),
-  );
-
-  assert.deepEqual([...stems].sort(), Object.keys(PAIRS).sort());
+test('each failing example produces exactly the declared findings', () => {
+	for (const pair of HEADER_PAIRS) {
+		assert.deepEqual(
+			entries(`examples/${pair.stem}.fail.headers`, pair.url),
+			[...pair.finds].sort(),
+			`${pair.stem}.fail: ${pair.about}`,
+		);
+	}
 });
 
-test('each pair has both sides', () => {
-  const files = new Set(readdirSync(EXAMPLES));
-  for (const stem of Object.keys(PAIRS)) {
-    assert.ok(files.has(`${stem}.fail.headers`), `${stem} has no failing side`);
-    assert.ok(files.has(`${stem}.pass.headers`), `${stem} has no corrected side`);
-  }
+test('each corrected example produces exactly its declared residual set', () => {
+	for (const pair of HEADER_PAIRS) {
+		assert.deepEqual(
+			entries(`examples/${pair.stem}.pass.headers`, pair.url),
+			[...pair.residual].sort(),
+			`${pair.stem}.pass: the residual set is wrong, so the correction does something other than what is declared`,
+		);
+	}
 });
 
-test('the failing side of each pair produces that pair finding', () => {
-  for (const [stem, id] of Object.entries(PAIRS)) {
-    const found = ids(judgeFile(join(EXAMPLES, `${stem}.fail.headers`), { url: URL }));
-    assert.ok(found.includes(id), `${stem}.fail.headers produced ${JSON.stringify(found)}`);
-  }
+test('every failing example actually produces something', () => {
+	for (const pair of HEADER_PAIRS) {
+		assert.ok(pair.finds.length > 0, `${pair.stem} declares no findings on its failing side, so it demonstrates nothing`);
+	}
 });
 
-test('the corrected side of each pair does not', () => {
-  for (const [stem, id] of Object.entries(PAIRS)) {
-    const found = ids(judgeFile(join(EXAMPLES, `${stem}.pass.headers`), { url: URL }));
-    assert.ok(!found.includes(id), `${stem}.pass.headers still produces ${id}`);
-  }
+test('no correction leaves the headline finding behind', () => {
+	for (const pair of HEADER_PAIRS) {
+		const residual = new Set(pair.residual);
+		const fixed = pair.finds.filter((entry) => !residual.has(entry));
+		assert.ok(
+			fixed.length > 0,
+			`${pair.stem}: every finding on the failing side survives the correction, so nothing was corrected`,
+		);
+	}
 });
 
-test('no corrected fixture trips any other pair finding either', () => {
-  // The cross-check. Without it a corrected example can quietly carry a
-  // different defect, and the pair still passes because its own check is
-  // satisfied.
-  const everyPairId = new Set(Object.values(PAIRS));
-
-  for (const stem of Object.keys(PAIRS)) {
-    const found = ids(judgeFile(join(EXAMPLES, `${stem}.pass.headers`), { url: URL }));
-    const trips = found.filter((id) => everyPairId.has(id));
-    assert.deepEqual(trips, [], `${stem}.pass.headers trips ${trips.join(', ')}`);
-  }
+test('exit codes follow from the declared severities', () => {
+	for (const pair of HEADER_PAIRS) {
+		const fail = judgeFile(`examples/${pair.stem}.fail.headers`, { url: pair.url });
+		const pass = judgeFile(`examples/${pair.stem}.pass.headers`, { url: pair.url });
+		assert.equal(fail.status, expectedExit(pair.finds), `${pair.stem}.fail exit code`);
+		assert.equal(pass.status, expectedExit(pair.residual), `${pair.stem}.pass exit code`);
+	}
 });
 
-test('no corrected fixture produces an error level finding', () => {
-  for (const stem of Object.keys(PAIRS)) {
-    const result = judgeFile(join(EXAMPLES, `${stem}.pass.headers`), { url: URL });
-    const errors = result.findings.filter((f) => f.level === 'error');
-    assert.deepEqual(errors, [], `${stem}.pass.headers: ${JSON.stringify(errors)}`);
-    assert.equal(result.status, 0);
-  }
+test('each pair says what it is about', () => {
+	for (const pair of HEADER_PAIRS) {
+		assert.ok(pair.about && pair.about.length > 60, `${pair.stem} does not explain itself`);
+	}
 });
 
-test('every fixture is a parseable header dump rather than prose', () => {
-  for (const name of readdirSync(EXAMPLES).filter((n) => n.endsWith('.headers'))) {
-    const result = judgeFile(join(EXAMPLES, name), { url: URL });
-    assert.notEqual(result.status, 2, `${name} was refused as input: ${result.stderr}`);
-  }
+test('each headers example is a header dump and not something else', () => {
+	for (const pair of HEADER_PAIRS) {
+		for (const side of ['fail', 'pass']) {
+			const text = readFileSync(join(EXAMPLES, `${pair.stem}.${side}.headers`), 'utf8');
+			assert.match(text, /^HTTP\//, `${pair.stem}.${side} does not start with a status line`);
+			assert.ok(text.endsWith('\n'), `${pair.stem}.${side} does not end with a newline`);
+		}
+	}
+});
+
+test('both sides of a pair differ', () => {
+	for (const pair of HEADER_PAIRS) {
+		const fail = readFileSync(join(EXAMPLES, `${pair.stem}.fail.headers`), 'utf8');
+		const pass = readFileSync(join(EXAMPLES, `${pair.stem}.pass.headers`), 'utf8');
+		assert.notEqual(fail, pass, `${pair.stem}: both sides are the same file`);
+	}
 });

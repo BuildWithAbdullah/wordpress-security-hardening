@@ -1,100 +1,162 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { judge, ids, cleanResponse } from '../tools/judge.mjs';
-import { FINDINGS, FAMILIES, ALL_IDS } from '../tools/catalogue.mjs';
+import { judgeFile } from '../tools/judge.mjs';
+import { ALL, ALL_IDS, FINDINGS, FAMILIES, AREAS, LEVELS, levelsFor } from '../tools/catalogue.mjs';
+import { HEADER_PAIRS } from '../tools/pairs.mjs';
+import { FIXTURES } from '../tools/fixtures.mjs';
 
 /**
- * One case per catalogued finding, each a real dump put through the real
- * script. If a finding cannot be driven out of a dump, it is a finding the
- * script cannot emit, and it has no business being documented.
+ * Everything here is driven out of a real run of the real script. Nothing is
+ * asserted about the catalogue on its own, because a catalogue that agrees with
+ * itself is documentation, and documentation of a checker drifts from the
+ * checker within about two commits.
+ *
+ * The run is done once and reused, because it is 53 invocations of a shell
+ * script and each one spawns awk several times.
  */
-const CASES = {
-  'missing/x-content-type-options': [cleanResponse({ 'x-content-type-options': null }), 'https://example.test/'],
-  'weak/x-content-type-options': [cleanResponse({ 'x-content-type-options': 'none' }), 'https://example.test/'],
-  'missing/x-frame-options': [cleanResponse({ 'x-frame-options': null }), 'https://example.test/'],
-  'weak/x-frame-options': [cleanResponse({ 'x-frame-options': 'ALLOWALL' }), 'https://example.test/'],
-  'missing/referrer-policy': [cleanResponse({ 'referrer-policy': null }), 'https://example.test/'],
-  'weak/referrer-policy': [cleanResponse({ 'referrer-policy': 'unsafe-url' }), 'https://example.test/'],
-  'missing/permissions-policy': [cleanResponse({ 'permissions-policy': null }), 'https://example.test/'],
-  'weak/permissions-policy': [cleanResponse({ 'permissions-policy': '' }), 'https://example.test/'],
-  'missing/strict-transport-security': [cleanResponse({ 'strict-transport-security': null }), 'https://example.test/'],
-  'weak/strict-transport-security': [cleanResponse({ 'strict-transport-security': 'max-age=300' }), 'https://example.test/'],
-  'disabled/strict-transport-security': [cleanResponse({ 'strict-transport-security': 'max-age=0' }), 'https://example.test/'],
-  'transport/not-https': [cleanResponse({ 'strict-transport-security': null }), 'http://example.test/'],
-  'csp/absent': [cleanResponse(), 'https://example.test/'],
-  'csp/unsafe-inline': [
-    cleanResponse({ 'content-security-policy': "default-src 'self'; script-src 'unsafe-inline'" }),
-    'https://example.test/',
-  ],
-  'leak/pingback': [cleanResponse({ 'x-pingback': 'https://example.test/xmlrpc.php' }), 'https://example.test/'],
-  'leak/version': [cleanResponse({ 'x-powered-by': 'PHP/8.2.4' }), 'https://example.test/'],
-  'redirect-only': [
-    'HTTP/1.1 301 Moved Permanently\nlocation: https://example.test/\nx-frame-options: SAMEORIGIN\n\n' +
-      cleanResponse({ 'x-frame-options': null }),
-    'https://example.test/',
-  ],
-};
+const observed = new Map(); // id -> Set of levels actually produced
 
-test('every catalogued finding has a case that drives it', () => {
-  const missing = ALL_IDS.filter((id) => !(id in CASES));
-  assert.deepEqual(missing, [], `catalogued but never driven: ${missing.join(', ')}`);
+function record(path, url) {
+	const args = url ? { url } : {};
+	const result = judgeFile(path, args);
+	for (const finding of result.findings) {
+		if (!observed.has(finding.id)) observed.set(finding.id, new Set());
+		observed.get(finding.id).add(finding.level);
+	}
+}
+
+for (const pair of HEADER_PAIRS) {
+	record(`examples/${pair.stem}.fail.headers`, pair.url);
+	record(`examples/${pair.stem}.pass.headers`, pair.url);
+}
+for (const fixture of FIXTURES) {
+	record(`fixtures/${fixture.file}`, fixture.url);
+}
+
+test('every catalogued finding is produced by a real run', () => {
+	const unreachable = ALL_IDS.filter((id) => !observed.has(id));
+	assert.deepEqual(
+		unreachable,
+		[],
+		'a finding nobody can produce is not a finding, it is a plan. Delete it or write the fixture that reaches it',
+	);
 });
 
-test('every case drives the finding it claims to', () => {
-  for (const [id, [dump, url]] of Object.entries(CASES)) {
-    const found = ids(judge(dump, { url }));
-    assert.ok(found.includes(id), `case for ${id} produced ${JSON.stringify(found)} instead`);
-  }
+test('every finding a real run produces is catalogued', () => {
+	const uncatalogued = [...observed.keys()].filter((id) => !ALL_IDS.includes(id));
+	assert.deepEqual(
+		uncatalogued,
+		[],
+		'the script emitted a finding that is not in tools/catalogue.mjs, so docs/07-every-finding.md does not describe what the script does',
+	);
 });
 
-test('the script emits no finding that is not catalogued', () => {
-  const seen = new Set();
-  for (const [dump, url] of Object.values(CASES)) {
-    for (const id of ids(judge(dump, { url }))) seen.add(id);
-  }
-  const stray = [...seen].filter((id) => !ALL_IDS.includes(id));
-  assert.deepEqual(stray, [], `emitted but not catalogued: ${stray.join(', ')}`);
-
-  // Both directions. The first test proves the catalogue is not aspirational;
-  // this proves the collected set is exactly the catalogue and nothing more.
-  assert.deepEqual([...seen].sort(), [...ALL_IDS].sort());
+/**
+ * The severity set, both ways, and the second direction is the one that does the
+ * work.
+ *
+ * Version 2 declared one level per finding and emitted
+ * weak/strict-transport-security at error when max-age was unparsable and at
+ * warn when it was short. The generated document therefore told a reader the
+ * run would not fail, and the run exited 1. Nothing caught it, because nothing
+ * compared the declaration against a run.
+ */
+test('every severity a real run produces is declared', () => {
+	const problems = [];
+	for (const [id, levels] of observed) {
+		const declared = levelsFor(id);
+		if (!declared) continue;
+		for (const level of levels) {
+			if (!declared.includes(level)) {
+				problems.push(`${id} was emitted at ${level}, which it does not declare (declares ${declared.join(', ')})`);
+			}
+		}
+	}
+	assert.deepEqual(problems, []);
 });
 
-test('the level each finding is catalogued with is the level it is emitted at', () => {
-  const levels = new Map([...FINDINGS, ...FAMILIES].map((f) => [f.id, f.level]));
-
-  for (const [id, [dump, url]] of Object.entries(CASES)) {
-    const emitted = judge(dump, { url }).findings.filter((f) => f.id === id);
-    assert.ok(emitted.length > 0, `${id} was not emitted`);
-    for (const finding of emitted) {
-      assert.equal(
-        finding.level,
-        levels.get(id),
-        `${id} is catalogued as ${levels.get(id)} and emitted as ${finding.level}`,
-      );
-    }
-  }
+test('every declared severity has been produced by some run', () => {
+	const problems = [];
+	for (const entry of ALL) {
+		const seen = observed.get(entry.id) ?? new Set();
+		for (const level of entry.levels) {
+			if (!seen.has(level)) {
+				problems.push(
+					`${entry.id} declares it can be a ${level} and no example or fixture has ever produced one. ` +
+						'Either write the case or stop declaring it',
+				);
+			}
+		}
+	}
+	assert.deepEqual(problems, []);
 });
 
-test('ids are unique and every entry says what it means', () => {
-  const all = [...FINDINGS, ...FAMILIES];
-  assert.equal(new Set(all.map((f) => f.id)).size, all.length, 'duplicate id in the catalogue');
-  for (const finding of all) {
-    assert.match(finding.id, /^[a-z0-9-]+(\/[a-z0-9-]+)?$/, `unusable id: ${finding.id}`);
-    assert.ok(['error', 'warn', 'note'].includes(finding.level), `bad level on ${finding.id}`);
-    assert.ok(finding.what.length > 30, `${finding.id} needs a real description`);
-    assert.ok(finding.what.trim().endsWith('.'), `${finding.id} description should be a sentence`);
-  }
+test('no finding declares a level that is not a level', () => {
+	for (const entry of ALL) {
+		assert.ok(entry.levels.length > 0, `${entry.id} declares no severity at all`);
+		for (const level of entry.levels) {
+			assert.ok(LEVELS.includes(level), `${entry.id} declares an unknown severity: ${level}`);
+		}
+	}
 });
 
-test('only an error level finding changes the exit code', () => {
-  for (const [id, [dump, url]] of Object.entries(CASES)) {
-    const result = judge(dump, { url });
-    const hasError = result.findings.some((f) => f.level === 'error');
-    assert.equal(
-      result.status,
-      hasError ? 1 : 0,
-      `${id}: exit ${result.status} with errors=${hasError}`,
-    );
-  }
+test('every finding belongs to a declared area', () => {
+	const areas = new Set(AREAS.map((a) => a.id));
+	for (const entry of ALL) {
+		assert.ok(areas.has(entry.area), `${entry.id} is in area ${entry.area}, which is not declared`);
+	}
+});
+
+test('every declared area has at least one finding in it', () => {
+	for (const area of AREAS) {
+		const members = ALL.filter((entry) => entry.area === area.id);
+		assert.ok(members.length > 0, `area ${area.id} has no findings`);
+	}
+});
+
+test('ids are unique', () => {
+	assert.equal(new Set(ALL_IDS).size, ALL_IDS.length);
+});
+
+test('every entry says what it is and why, one reason per entry', () => {
+	for (const entry of ALL) {
+		assert.ok(entry.reason && entry.reason.length > 20, `${entry.id} does not state its reason`);
+		assert.ok(entry.what && entry.what.length > 40, `${entry.id} does not explain itself`);
+	}
+});
+
+test('a family carries something and a fixed finding does not', () => {
+	for (const family of FAMILIES) {
+		assert.ok(family.carries && family.carries.length > 5, `${family.id} is a family and says nothing about what it carries`);
+	}
+	for (const finding of FINDINGS) {
+		assert.ok(!('carries' in finding), `${finding.id} is not a family and should not declare a payload`);
+	}
+});
+
+/**
+ * One entry per reason, not one per check. The weakest form of this rule that
+ * can be asserted mechanically: no two entries may describe the same reason in
+ * the same area, and every required header must have the full set of reasons
+ * rather than a single catch-all.
+ */
+test('each required header has every reason it can fail for', () => {
+	const required = ['x-content-type-options', 'x-frame-options', 'referrer-policy', 'permissions-policy'];
+	for (const header of required) {
+		for (const prefix of ['missing', 'empty', 'weak', 'conflict']) {
+			assert.ok(
+				ALL_IDS.includes(`${prefix}/${header}`),
+				`${header} has no ${prefix} reason, so two different problems share one finding`,
+			);
+		}
+	}
+});
+
+test('no two entries state the same reason', () => {
+	const seen = new Map();
+	for (const entry of ALL) {
+		const key = entry.reason.trim().toLowerCase();
+		assert.ok(!seen.has(key), `${entry.id} and ${seen.get(key)} state the same reason`);
+		seen.set(key, entry.id);
+	}
 });

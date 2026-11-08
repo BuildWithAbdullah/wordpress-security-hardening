@@ -71,7 +71,10 @@ test('an empty header value is not treated as an absent header', () => {
     url: 'https://example.test/',
   });
 
-  assert.ok(ids(empty).includes('weak/permissions-policy'));
+  // Three reasons rather than two, since version 3. A header present with an
+  // empty value, a header present with a value that does nothing, and a header
+  // that is not there are three different fixes, so they are three findings.
+  assert.ok(ids(empty).includes('empty/permissions-policy'));
   assert.ok(ids(absent).includes('missing/permissions-policy'));
   assert.notDeepEqual(ids(empty), ids(absent));
 });

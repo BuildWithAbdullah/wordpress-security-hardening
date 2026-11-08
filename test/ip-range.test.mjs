@@ -105,29 +105,128 @@ test('the client address prefers the value the client cannot forge', () => {
   assert.equal(out.results['0'].value, '198.51.100.7');
 });
 
-test('a trusted proxy chain yields the leftmost address', () => {
+/**
+ * Version 2 had a test here named "a trusted proxy chain yields the leftmost
+ * address", and it passed. It was asserting the defect. The leftmost entry of
+ * X-Forwarded-For is the one value in the chain the client always controls, so
+ * a test that required it to be returned was a test requiring the allowlist to
+ * be forgeable, and it is the reason the bug survived a rewrite of the file it
+ * lived in.
+ *
+ * The replacements below count from the other end, and the first of them is the
+ * attack rather than the happy path, deliberately.
+ */
+test('a forged leftmost entry is not what the lookup returns', () => {
   const out = probe({
     load: [PLUGIN],
     state: {
       server: {
+        // One proxy at 10.0.0.1. The attacker is at 203.0.113.99 and has sent
+        // an X-Forwarded-For claiming to be the allowlisted address, which the
+        // proxy appended to rather than replaced.
         REMOTE_ADDR: '10.0.0.1',
-        HTTP_X_FORWARDED_FOR: '203.0.113.42, 10.0.0.5, 10.0.0.1',
+        HTTP_X_FORWARDED_FOR: '203.0.113.42, 203.0.113.99',
       },
     },
-    constants: { WPSH_TRUST_PROXY: true },
+    constants: { WPSH_TRUSTED_PROXY_HOPS: 1 },
+    ops: [{ op: 'call', fn: 'wpsh_client_ip', args: [] }],
+  });
+  assert.equal(out.results['0'].value, '203.0.113.99');
+});
+
+test('the real client behind a declared proxy is still found', () => {
+  const out = probe({
+    load: [PLUGIN],
+    state: {
+      server: { REMOTE_ADDR: '10.0.0.1', HTTP_X_FORWARDED_FOR: '203.0.113.42' },
+    },
+    constants: { WPSH_TRUSTED_PROXY_HOPS: 1 },
     ops: [{ op: 'call', fn: 'wpsh_client_ip', args: [] }],
   });
   assert.equal(out.results['0'].value, '203.0.113.42');
 });
 
-test('a junk forwarding header falls back rather than returning junk', () => {
+test('two declared proxies read two entries in from the end', () => {
   const out = probe({
     load: [PLUGIN],
-    state: { server: { REMOTE_ADDR: '10.0.0.1', HTTP_X_FORWARDED_FOR: 'nonsense' } },
+    state: {
+      server: {
+        REMOTE_ADDR: '10.0.0.1',
+        HTTP_X_FORWARDED_FOR: '198.51.100.9, 203.0.113.42, 10.0.0.5',
+      },
+    },
+    constants: { WPSH_TRUSTED_PROXY_HOPS: 2 },
+    ops: [{ op: 'call', fn: 'wpsh_client_ip', args: [] }],
+  });
+  assert.equal(out.results['0'].value, '203.0.113.42');
+});
+
+test('WPSH_TRUST_PROXY from version 2 reads as one hop, and is no longer forgeable', () => {
+  const out = probe({
+    load: [PLUGIN],
+    state: {
+      server: {
+        REMOTE_ADDR: '10.0.0.1',
+        HTTP_X_FORWARDED_FOR: '203.0.113.42, 203.0.113.99',
+      },
+    },
     constants: { WPSH_TRUST_PROXY: true },
     ops: [{ op: 'call', fn: 'wpsh_client_ip', args: [] }],
   });
-  assert.equal(out.results['0'].value, '10.0.0.1');
+  // An upgrade keeps working without an edit to wp-config.php, and the bypass
+  // closes. Reading the old constant as nothing would have silently disabled
+  // the allowlist on every site that had it.
+  assert.equal(out.results['0'].value, '203.0.113.99');
+});
+
+test('a chain shorter than the declared hops refuses to answer', () => {
+  const out = probe({
+    load: [PLUGIN],
+    state: { server: { REMOTE_ADDR: '10.0.0.1', HTTP_X_FORWARDED_FOR: '203.0.113.42' } },
+    constants: { WPSH_TRUSTED_PROXY_HOPS: 3 },
+    ops: [{ op: 'call', fn: 'wpsh_client_ip', args: [] }],
+  });
+  // Taking the leftmost entry here is exactly the defect, so it declines. The
+  // caller treats null as "cannot establish" and locks nobody out, which makes
+  // a wrong hop count loud rather than quietly forgeable.
+  assert.equal(out.results['0'].value, null);
+});
+
+test('a direct request that skipped the proxy uses the peer address', () => {
+  const out = probe({
+    load: [PLUGIN],
+    state: { server: { REMOTE_ADDR: '203.0.113.42' } },
+    constants: { WPSH_TRUSTED_PROXY_HOPS: 1 },
+    ops: [{ op: 'call', fn: 'wpsh_client_ip', args: [] }],
+  });
+  // No forwarded chain means nothing to count into, and REMOTE_ADDR is both the
+  // visitor and unforgeable.
+  assert.equal(out.results['0'].value, '203.0.113.42');
+});
+
+test('a junk forwarding header is refused rather than guessed around', () => {
+  const out = probe({
+    load: [PLUGIN],
+    state: { server: { REMOTE_ADDR: '10.0.0.1', HTTP_X_FORWARDED_FOR: 'nonsense' } },
+    constants: { WPSH_TRUSTED_PROXY_HOPS: 1 },
+    ops: [{ op: 'call', fn: 'wpsh_client_ip', args: [] }],
+  });
+  // The chain is one entry plus the peer, so one hop in from the end is the
+  // junk entry, and junk does not validate. Falling back to the peer would be
+  // reading a different position than the site declared, which is the kind of
+  // helpfulness that put the original bug there.
+  assert.equal(out.results['0'].value, null);
+});
+
+test('no forwarding and no proxies declared uses the peer address', () => {
+  const out = probe({
+    load: [PLUGIN],
+    state: { server: { REMOTE_ADDR: '203.0.113.42', HTTP_X_FORWARDED_FOR: '198.51.100.9' } },
+    ops: [{ op: 'call', fn: 'wpsh_client_ip', args: [] }],
+  });
+  // With no proxy declared the forwarding header is ignored entirely, which is
+  // the default and the safe one.
+  assert.equal(out.results['0'].value, '203.0.113.42');
 });
 
 test('no usable address at all is reported as none, not as a string', () => {
